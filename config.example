@@ -1,0 +1,24 @@
+# LIVE
+#ALPACA_KEY          = "YOUR ALPACA KEY"
+#ALPACA_SECRET_KEY   = "YOUR ALPACA SECRET KEY"
+#ALPACA_URL          = "https://api.alpaca.markets"
+
+# TEST
+ALPACA_KEY           = "YOUR ALPACA KEY"
+ALPACA_SECRET_KEY    = "YOUR ALPACA SECRET KEY"
+ALPACA_URL           = "https://paper-api.alpaca.markets"
+
+# STOCK LIST
+# Example: NAME_STOCK : PERCENT (%)
+ALPACA_STOCK_CONFIG  = {
+    'AAPL'  : 10.0,
+    'CMCSA' : 10.0,
+    'TSM'   : 10.0,
+    'BUD'   : 10.0
+}
+
+# TIME TICKERS
+ALPACA_SLEEP_TIMEOUT = 480 # 8H
+
+# INFO
+ALPACA_STOCKING_BOT_VERSION = "0.3.2"
