@@ -1,210 +1,524 @@
-### DEPENDENCIES ###
-from datetime import date
-import alpaca_trade_api as api
-import numpy as np 
-import pandas as pd
-import time
-import warnings
-import threading
-import math
-import config
+from __future__ import annotations
+
+import csv
+import json
 import logging
-warnings.filterwarnings('ignore')
+import math
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import alpaca_trade_api as api
+import pandas as pd
+
+import config
+from indicators import bars_to_dataframe
+from strategy import StrategyConfig, StrategyEngine
+
 
 class StockBot:
-    def __init__(self):
+    def __init__(self) -> None:
         self.alpaca = api.REST(config.ALPACA_KEY, config.ALPACA_SECRET_KEY, config.ALPACA_URL, "v2")
-        self.account = self.alpaca.get_account()
-
-        self.sleeper = config.ALPACA_SLEEP_TIMEOUT
         self.symbols = config.ALPACA_STOCK_CONFIG
         self.bot_version = config.ALPACA_STOCKING_BOT_VERSION
-
-        self.data_timeframe = "1Day"
+        self.sleeper = int(config.ALPACA_SLEEP_TIMEOUT)
+        self.strategy_config = StrategyConfig.from_module(config)
+        self.strategy = StrategyEngine(self.strategy_config)
+        self.state_path = Path(getattr(config, "ALPACA_STATE_PATH", "bot_state.json"))
+        self.journal_path = Path(getattr(config, "ALPACA_TRADE_JOURNAL", "trade_journal.csv"))
 
         log_format = "%(levelname)s %(asctime)s - %(message)s"
-        logging.basicConfig(filename = "debug.log", filemode = "w", format = log_format, level = logging.DEBUG)
+        logging.basicConfig(filename="debug.log", filemode="a", format=log_format, level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        self.state = self.load_state()
+        self.ensure_journal_exists()
 
-    def run(self):
-        logger = logging.getLogger()
+    def load_state(self) -> dict[str, Any]:
+        if self.state_path.exists():
+            with self.state_path.open("r", encoding="utf-8") as file_pointer:
+                return json.load(file_pointer)
+        return {"open_trades": {}, "risk_windows": {}, "performance": {"consecutive_losses": 0, "paused_until": None}}
 
-        logger.debug(f"Stocking Bot v{self.bot_version}. Running.... ---")
-        logger.debug("I am checking if market is open.... ---")
-        marketOpenThread = threading.Thread(target=self.isMarketOpen)
-        marketOpenThread.start()
-        marketOpenThread.join()
-        logger.debug("The market is open. Good luck! ---")
+    def save_state(self) -> None:
+        with self.state_path.open("w", encoding="utf-8") as file_pointer:
+            json.dump(self.state, file_pointer, indent=2, sort_keys=True)
 
-        logger.debug("Time to clean. I am starting close all positions!... ---")
-        self.cleaningTrade()
-        logger.debug("Clening done..... ---")
+    def performance_state(self) -> dict[str, Any]:
+        return self.state.setdefault("performance", {"consecutive_losses": 0, "paused_until": None})
 
-        logger.debug("I am running first trading cycle.... ---")
-        tradeBotThread = threading.Thread(target=self.tradeBot)
-        tradeBotThread.start()
-        tradeBotThread.join()
-        logger.debug("First trading cycle done. Sleeping.... ---")
+    def ensure_journal_exists(self) -> None:
+        if self.journal_path.exists():
+            return
+        with self.journal_path.open("w", encoding="utf-8", newline="") as file_pointer:
+            writer = csv.writer(file_pointer)
+            writer.writerow(
+                [
+                    "timestamp",
+                    "event",
+                    "symbol",
+                    "side",
+                    "quantity",
+                    "price",
+                    "reason",
+                    "atr",
+                    "stop_price",
+                    "risk_amount",
+                    "r_multiple",
+                    "signal_score",
+                    "relative_strength",
+                    "effective_risk_pct",
+                    "market_regime",
+                    "mfe_r",
+                    "mae_r",
+                    "notes",
+                ]
+            )
 
-    def cleaningTrade(self):
-        logger = logging.getLogger()        
-        try:
-            portfolio = self.alpaca.list_positions()
-            for position in portfolio:
-                day_super_trend_signal_10_03 = self.getSuperTrend(position.symbol, 10, 3, self.data_timeframe)
-                day_super_trend_signal_01_01 = self.getSuperTrend(position.symbol, 1, 1, self.data_timeframe)
-                #
-                if day_super_trend_signal_10_03 == 'hold' or day_super_trend_signal_01_01 == 'hold':
-                    logger.debug(f"I am trying to close all positions for the {position.symbol}. ---")
-                    self.alpaca.close_position(position.symbol)
-                    time.sleep(1)
-                    logger.debug(f"All positions on the {position.symbol} are closed successfully! ---")
-                else:
-                    logger.debug(f"The order for close by {position.symbol} was skipping! ---")
-        except Exception as e:
-            logger.error(f"I can't close positions for a reason: {e} ---")  
+    def append_journal(
+        self,
+        event: str,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: float,
+        reason: str,
+        atr_value: float,
+        stop_price: float,
+        risk_amount: float,
+        r_multiple: float = 0.0,
+        signal_score: float = 0.0,
+        relative_strength: float | None = None,
+        effective_risk_pct: float = 0.0,
+        market_regime: str = "",
+        mfe_r: float = 0.0,
+        mae_r: float = 0.0,
+        notes: str = "",
+    ) -> None:
+        with self.journal_path.open("a", encoding="utf-8", newline="") as file_pointer:
+            writer = csv.writer(file_pointer)
+            writer.writerow(
+                [
+                    datetime.utcnow().isoformat(),
+                    event,
+                    symbol,
+                    side,
+                    quantity,
+                    round(price, 4),
+                    reason,
+                    round(atr_value, 4),
+                    round(stop_price, 4),
+                    round(risk_amount, 4),
+                    round(r_multiple, 4),
+                    round(signal_score, 4),
+                    "" if relative_strength is None else round(relative_strength, 4),
+                    round(effective_risk_pct, 4),
+                    market_regime,
+                    round(mfe_r, 4),
+                    round(mae_r, 4),
+                    notes,
+                ]
+            )
 
-    def isMarketOpen(self):
-        logger = logging.getLogger()
-        isOpen = self.alpaca.get_clock().is_open
-        while(not isOpen):
-            next_open_time = self.alpaca.get_clock().next_open.timestamp()
-            current_time = self.alpaca.get_clock().timestamp.timestamp()
-            difference = (int(next_open_time) - int(current_time))/60
-            hours = round(difference // 60)
-            remaining_minutes = round(difference % 60)
-            logger.debug(f"The {hours} hours and {remaining_minutes} minutes until the next market trade session! ---")
-            logger.debug(f"I am sleeping for {hours} hours and {remaining_minutes} minutes. Good night! :) ---")
-            time.sleep((difference+15)*60)
-            isOpen = self.alpaca.get_clock().is_open
-            
-    def submitOrder(self, symbol, quantity, side, price):
-        logger = logging.getLogger()
+    def refresh_account(self):
+        return self.alpaca.get_account()
 
-        low_price   = round((price * 0.99), 2) # SL 01%
-        hight_price = round((price * 1.05), 2) # TP 05%
+    def wait_for_market_open(self) -> None:
+        clock = self.alpaca.get_clock()
+        while not clock.is_open:
+            next_open_time = clock.next_open.timestamp()
+            current_time = clock.timestamp.timestamp()
+            difference_minutes = max((int(next_open_time) - int(current_time)) / 60, 1)
+            hours = round(difference_minutes // 60)
+            remaining_minutes = round(difference_minutes % 60)
+            self.logger.info("Market closed. Sleeping for %s hours and %s minutes.", hours, remaining_minutes)
+            time.sleep((difference_minutes + 5) * 60)
+            clock = self.alpaca.get_clock()
 
-        logger.debug(f"The take profit for {symbol} is {hight_price}---")
-        logger.debug(f"The stop loss for {symbol} is {low_price}---")
-        logger.debug(f"Signal: {side} ---")
+    def fetch_frame(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        bars = self.alpaca.get_bars(symbol, timeframe, limit=limit)
+        return self.strategy.prepare_frame(bars_to_dataframe(bars))
 
-        try:
-            self.alpaca.submit_order(
-                symbol = symbol,
-                qty = quantity,
-                side = side,
-                type = 'market',
-                time_in_force = 'day',
-                order_class = 'bracket',
-                stop_loss={
-                    'stop_price': low_price
-                },
-                take_profit={
-                    'limit_price': hight_price
-                }
-            )             
-            logger.debug(f"The order for {symbol} for {quantity} shares @ {price} has been submitted! ---")
-        except Exception as e:
-            logger.error(e)
-            logger.error(f"The order for {symbol} for {quantity} shares @ {price} has NOT been submitted! ---")
+    def get_mid_price(self, symbol: str, fallback_price: float | None = None) -> tuple[float, float | None]:
+        quote = self.alpaca.get_latest_quote(symbol)
+        ask_price = float(getattr(quote, "ap", 0.0) or getattr(quote, "ask_price", 0.0) or 0.0)
+        bid_price = float(getattr(quote, "bp", 0.0) or getattr(quote, "bid_price", 0.0) or 0.0)
+        if ask_price > 0 and bid_price > 0:
+            mid_price = (ask_price + bid_price) / 2
+            spread_pct = ((ask_price - bid_price) / mid_price) * 100 if mid_price else None
+            return mid_price, spread_pct
+        if ask_price > 0:
+            return ask_price, None
+        if bid_price > 0:
+            return bid_price, None
+        if fallback_price is not None:
+            return fallback_price, None
+        raise ValueError(f"Unable to determine price for {symbol}")
 
-    def symbolPositionBySymbol(self, symbol):
-        logger = logging.getLogger()
-        try:
-            position = self.alpaca.get_position(symbol)
-            return position
-        except:
+    def get_market_context(self) -> dict[str, Any]:
+        market_frame = self.fetch_frame(self.strategy_config.market_symbol, self.strategy_config.daily_timeframe, 260)
+        benchmark_frame = self.fetch_frame(self.strategy_config.benchmark_symbol, self.strategy_config.daily_timeframe, 260)
+        volatility_frame = None
+        if self.strategy_config.volatility_symbol:
+            volatility_frame = self.fetch_frame(self.strategy_config.volatility_symbol, self.strategy_config.daily_timeframe, 260)
+        regime = self.strategy.evaluate_market_regime(market_frame, benchmark_frame, volatility_frame)
+        return {
+            "regime": regime,
+            "market_frame": market_frame,
+            "benchmark_frame": benchmark_frame,
+            "volatility_frame": volatility_frame,
+        }
+
+    def refresh_risk_windows(self, equity: float) -> None:
+        today = datetime.utcnow().date().isoformat()
+        iso_year, iso_week, _ = datetime.utcnow().isocalendar()
+        current_week = f"{iso_year}-W{iso_week}"
+        risk_windows = self.state.setdefault("risk_windows", {})
+        daily_window = risk_windows.get("daily")
+        weekly_window = risk_windows.get("weekly")
+
+        if not daily_window or daily_window.get("date") != today:
+            risk_windows["daily"] = {"date": today, "start_equity": equity}
+        if not weekly_window or weekly_window.get("week") != current_week:
+            risk_windows["weekly"] = {"week": current_week, "start_equity": equity}
+
+    def risk_limits_breached(self, equity: float) -> tuple[bool, str]:
+        self.refresh_risk_windows(equity)
+        daily_start = float(self.state["risk_windows"]["daily"]["start_equity"])
+        weekly_start = float(self.state["risk_windows"]["weekly"]["start_equity"])
+        daily_drawdown = ((equity - daily_start) / daily_start) * 100 if daily_start else 0.0
+        weekly_drawdown = ((equity - weekly_start) / weekly_start) * 100 if weekly_start else 0.0
+
+        if daily_drawdown <= -self.strategy_config.daily_loss_limit_pct:
+            return True, f"daily loss limit reached: {daily_drawdown:.2f}%"
+        if weekly_drawdown <= -self.strategy_config.weekly_loss_limit_pct:
+            return True, f"weekly loss limit reached: {weekly_drawdown:.2f}%"
+        return False, "risk limits are fine"
+
+    def entries_paused(self) -> tuple[bool, str]:
+        paused_until = self.performance_state().get("paused_until")
+        if not paused_until:
+            return False, ""
+        paused_until_ts = datetime.fromisoformat(paused_until)
+        if datetime.utcnow() < paused_until_ts:
+            return True, f"cooldown active until {paused_until_ts.isoformat()}"
+        self.performance_state()["paused_until"] = None
+        return False, ""
+
+    def update_performance_after_exit(self, r_multiple: float) -> None:
+        performance = self.performance_state()
+        if r_multiple < 0:
+            performance["consecutive_losses"] = int(performance.get("consecutive_losses", 0)) + 1
+        else:
+            performance["consecutive_losses"] = 0
+
+        if performance["consecutive_losses"] >= self.strategy_config.max_consecutive_losses:
+            performance["paused_until"] = (datetime.utcnow() + timedelta(minutes=self.strategy_config.cooldown_minutes)).isoformat()
+
+    def effective_risk_pct(self, equity: float) -> float:
+        self.refresh_risk_windows(equity)
+        weekly_start = float(self.state["risk_windows"]["weekly"]["start_equity"])
+        consecutive_losses = int(self.performance_state().get("consecutive_losses", 0))
+        return self.strategy.calculate_effective_risk_pct(equity, weekly_start, consecutive_losses)
+
+    def position_size(self, equity: float, entry_price: float, stop_price: float) -> tuple[int, float, float]:
+        risk_per_share = entry_price - stop_price
+        if risk_per_share <= 0:
+            return 0, 0.0, 0.0
+
+        effective_risk_pct = self.effective_risk_pct(equity)
+        risk_budget = equity * (effective_risk_pct / 100)
+        max_position_value = equity * (self.strategy_config.max_position_pct / 100)
+        quantity_by_risk = math.floor(risk_budget / risk_per_share)
+        quantity_by_value = math.floor(max_position_value / entry_price)
+        quantity = max(0, min(quantity_by_risk, quantity_by_value))
+        return quantity, risk_budget, effective_risk_pct
+
+    def get_positions(self) -> dict[str, Any]:
+        return {position.symbol: position for position in self.alpaca.list_positions()}
+
+    def remove_closed_positions_from_state(self, live_positions: dict[str, Any]) -> None:
+        open_trades = self.state.setdefault("open_trades", {})
+        stale_symbols = [symbol for symbol in open_trades if symbol not in live_positions]
+        for symbol in stale_symbols:
+            del open_trades[symbol]
+
+    def correlated_position_count(self, candidate_symbol: str, open_symbols: list[str]) -> int:
+        if not open_symbols:
+            return 0
+
+        candidate_frame = self.fetch_frame(candidate_symbol, self.strategy_config.daily_timeframe, self.strategy_config.correlation_lookback + 20)
+        if candidate_frame.empty:
+            return 0
+        candidate_returns = candidate_frame["close"].pct_change().dropna()
+
+        correlated = 0
+        for symbol in open_symbols:
+            comparison_frame = self.fetch_frame(symbol, self.strategy_config.daily_timeframe, self.strategy_config.correlation_lookback + 20)
+            if comparison_frame.empty:
+                continue
+            comparison_returns = comparison_frame["close"].pct_change().dropna()
+            combined = pd.concat([candidate_returns, comparison_returns], axis=1, join="inner").dropna().tail(self.strategy_config.correlation_lookback)
+            if len(combined) < 20:
+                continue
+            correlation = combined.iloc[:, 0].corr(combined.iloc[:, 1])
+            if correlation is not None and correlation >= self.strategy_config.correlation_threshold:
+                correlated += 1
+        return correlated
+
+    def submit_market_order(self, symbol: str, quantity: int, side: str) -> None:
+        self.alpaca.submit_order(symbol=symbol, qty=quantity, side=side, type="market", time_in_force="day")
+
+    def initialise_trade_state(self, position: Any, daily_frame: pd.DataFrame, current_price: float) -> dict[str, Any]:
+        daily_row = daily_frame.iloc[-1]
+        atr_value = float(daily_row["atr"]) if not pd.isna(daily_row["atr"]) else current_price * 0.02
+        entry_price = float(position.avg_entry_price)
+        stop_price = entry_price - atr_value * self.strategy_config.atr_stop_multiplier
+        risk_per_share = max(entry_price - stop_price, 0.01)
+        quantity = int(float(position.qty))
+        return {
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "take_profit_price": entry_price + risk_per_share * self.strategy_config.partial_take_profit_r,
+            "quantity": quantity,
+            "remaining_quantity": quantity,
+            "partial_exit_done": False,
+            "max_price": max(entry_price, current_price),
+            "min_price": min(entry_price, current_price),
+            "risk_per_share": risk_per_share,
+            "atr_value": atr_value,
+            "signal_score": 0.0,
+            "relative_strength": None,
+        }
+
+    def mfe_mae_r(self, trade_state: dict[str, Any]) -> tuple[float, float]:
+        risk_per_share = float(trade_state.get("risk_per_share", 0.0))
+        if risk_per_share <= 0:
+            return 0.0, 0.0
+        entry_price = float(trade_state["entry_price"])
+        max_price = float(trade_state.get("max_price", entry_price))
+        min_price = float(trade_state.get("min_price", entry_price))
+        mfe_r = (max_price - entry_price) / risk_per_share
+        mae_r = (entry_price - min_price) / risk_per_share
+        return mfe_r, mae_r
+
+    def manage_open_positions(self, live_positions: dict[str, Any], market_context: dict[str, Any]) -> None:
+        open_trades = self.state.setdefault("open_trades", {})
+        regime = market_context["regime"]
+
+        for symbol, position in live_positions.items():
+            daily_frame = self.fetch_frame(symbol, self.strategy_config.daily_timeframe, 260)
+            pullback_frame = self.fetch_frame(symbol, self.strategy_config.pullback_timeframe, 200)
+            fallback_price = float(daily_frame.iloc[-1]["close"]) if not daily_frame.empty else float(position.current_price)
+            current_price, _ = self.get_mid_price(symbol, fallback_price)
+
+            trade_state = open_trades.get(symbol)
+            if trade_state is None:
+                trade_state = self.initialise_trade_state(position, daily_frame, current_price)
+                open_trades[symbol] = trade_state
+
+            trade_state["max_price"] = max(float(trade_state.get("max_price", current_price)), current_price)
+            trade_state["min_price"] = min(float(trade_state.get("min_price", current_price)), current_price)
+            decision = self.strategy.build_exit_decision(symbol, trade_state, daily_frame, pullback_frame, current_price, regime)
+            trade_state["stop_price"] = float(decision.trailing_stop_price or trade_state["stop_price"])
+            trade_state["atr_value"] = float(decision.atr_value or trade_state.get("atr_value", 0.0))
+            mfe_r, mae_r = self.mfe_mae_r(trade_state)
+
+            if decision.action == "partial_sell" and not trade_state.get("partial_exit_done"):
+                partial_quantity = max(1, int(float(position.qty) * self.strategy_config.partial_exit_pct))
+                partial_quantity = min(partial_quantity, int(float(position.qty)))
+                if partial_quantity > 0:
+                    self.submit_market_order(symbol, partial_quantity, "sell")
+                    trade_state["partial_exit_done"] = True
+                    trade_state["remaining_quantity"] = max(0, int(float(position.qty)) - partial_quantity)
+                    trade_state["stop_price"] = max(float(trade_state["entry_price"]), float(trade_state["stop_price"]))
+                    risk_amount = float(trade_state["risk_per_share"]) * partial_quantity
+                    r_multiple = ((current_price - float(trade_state["entry_price"])) * partial_quantity) / risk_amount if risk_amount else 0.0
+                    self.append_journal(
+                        "partial_exit",
+                        symbol,
+                        "sell",
+                        partial_quantity,
+                        current_price,
+                        decision.reason,
+                        float(trade_state["atr_value"]),
+                        float(trade_state["stop_price"]),
+                        risk_amount,
+                        r_multiple,
+                        signal_score=float(trade_state.get("signal_score", 0.0)),
+                        relative_strength=trade_state.get("relative_strength"),
+                        market_regime=regime[1],
+                        mfe_r=mfe_r,
+                        mae_r=mae_r,
+                        notes="partial profit",
+                    )
+
+            elif decision.action == "sell":
+                exit_quantity = int(float(position.qty))
+                if exit_quantity > 0:
+                    self.submit_market_order(symbol, exit_quantity, "sell")
+                    risk_amount = float(trade_state["risk_per_share"]) * int(float(trade_state.get("quantity", exit_quantity)))
+                    realized = (current_price - float(trade_state["entry_price"])) * exit_quantity
+                    r_multiple = realized / risk_amount if risk_amount else 0.0
+                    self.append_journal(
+                        "exit",
+                        symbol,
+                        "sell",
+                        exit_quantity,
+                        current_price,
+                        decision.reason,
+                        float(trade_state["atr_value"]),
+                        float(trade_state["stop_price"]),
+                        risk_amount,
+                        r_multiple,
+                        signal_score=float(trade_state.get("signal_score", 0.0)),
+                        relative_strength=trade_state.get("relative_strength"),
+                        market_regime=regime[1],
+                        mfe_r=mfe_r,
+                        mae_r=mae_r,
+                        notes="full exit",
+                    )
+                    self.update_performance_after_exit(r_multiple)
+                    del open_trades[symbol]
+
+    def evaluate_new_entries(self, account: Any, live_positions: dict[str, Any], market_context: dict[str, Any]) -> None:
+        open_trades = self.state.setdefault("open_trades", {})
+        regime = market_context["regime"]
+        benchmark_frame = market_context["benchmark_frame"]
+        equity = float(account.equity)
+        open_symbols = list(live_positions.keys())
+
+        if len(open_symbols) >= self.strategy_config.max_open_positions:
+            self.logger.info("Skipping new entries: max open positions reached.")
             return
 
-    def symbolPositionByAssetID(self, asset_id):
-        logger = logging.getLogger()
-        try:
-            position = self.alpaca.get_position(asset_id)
-            return position
-        except:
-            return 
-            
-    def tradeBot(self):
-        logger = logging.getLogger()
+        limits_hit, limits_reason = self.risk_limits_breached(equity)
+        if limits_hit:
+            self.logger.warning("Skipping new entries: %s", limits_reason)
+            return
 
-        quoteList = []
-        
-        try:
-            if self.account.trading_blocked:
-                logger.debug(f"Account is currently restricted from trading! ---")
-            else:
-                logger.debug(f"Account status is: {self.account.status}. ---")
-                cash = float(self.account.cash)
-                logger.debug(f"Account cash is: {cash}. ---")
-                for symbol in self.symbols:
-                    price = self.alpaca.get_latest_quote(symbol).ap 
-                    time.sleep(1)
+        paused, pause_reason = self.entries_paused()
+        if paused:
+            self.logger.warning("Skipping new entries: %s", pause_reason)
+            return
 
-                    if price > 0:   
-                        logger.debug(f"Current price: {price}. ---")
+        candidates: list[dict[str, Any]] = []
 
-                        percent_trade = float(self.symbols[symbol])
-                        logger.debug(f"Percent trade: {percent_trade}. ---")
+        for symbol in self.symbols:
+            if symbol in live_positions or symbol in open_trades:
+                continue
 
-                        limit_trade = (cash * (percent_trade / 100))
-                        logger.debug(f"Limit trade : {limit_trade}. ---")
+            correlated_count = self.correlated_position_count(symbol, open_symbols)
+            if correlated_count >= self.strategy_config.max_correlated_positions:
+                self.logger.info("Skipping %s: correlation limit reached.", symbol)
+                continue
 
-                        quantity = 0
+            daily_frame = self.fetch_frame(symbol, self.strategy_config.daily_timeframe, 260)
+            pullback_frame = self.fetch_frame(symbol, self.strategy_config.pullback_timeframe, 200)
+            entry_frame = self.fetch_frame(symbol, self.strategy_config.entry_timeframe, 200)
+            fallback_price = float(entry_frame.iloc[-1]["close"]) if not entry_frame.empty else None
+            current_price, spread_pct = self.get_mid_price(symbol, fallback_price)
 
-                        if self.symbolPositionBySymbol(symbol):
-                            position = self.symbolPositionBySymbol(symbol)
-                            market_value = abs(float(position.market_value))
-                            logger.debug(f"Market value : {market_value}. ---")
-                            free_trade = limit_trade - market_value
-                            quantity = (round(free_trade / price))
-                            logger.debug(f"Free trade : {free_trade}. ---")
-                        else:
-                            quantity = (round(limit_trade / price))
-                            logger.warning(f"I don't have position by {symbol}! ---")
-                        
-                        day_super_trend_signal_10_03 = self.getSuperTrend(symbol, 10, 3, self.data_timeframe)
-                        day_super_trend_signal_01_01 = self.getSuperTrend(symbol, 1, 1, self.data_timeframe)
+            decision = self.strategy.build_entry_decision(
+                symbol,
+                daily_frame,
+                pullback_frame,
+                entry_frame,
+                current_price,
+                spread_pct,
+                regime,
+                benchmark_daily=benchmark_frame,
+            )
+            if decision.action != "buy":
+                self.logger.info(decision.reason)
+                continue
 
-                        logger.debug(f"<<< ST Signal: {day_super_trend_signal_10_03} for {symbol}... >>>")
-                        logger.debug(f"<<< ST Signal: {day_super_trend_signal_01_01} for {symbol}... >>>")
+            candidates.append(
+                {
+                    "symbol": symbol,
+                    "decision": decision,
+                }
+            )
 
-                        if day_super_trend_signal_10_03 == 'hold' or day_super_trend_signal_01_01 == 'hold':
-                            logger.warning(f"The sp500 super trend indicator has hold signal for {symbol}...skipping! ---")
-                            quantity = 0
-                        else:
-                            if quantity > 1:
-                                submitOrderThread = threading.Thread(target = self.submitOrder, args=[symbol, quantity, "buy", price])
-                                submitOrderThread.start()
-                                submitOrderThread.join()
-                            else:
-                                logger.warning(f"I am sorry. All authorized funds for the {symbol} are currently occupied for trading...skipping! ---")
-                    else:
-                        logger.warning(f"I can't get the price per {symbol} at the moment...skipping! ---")
-        except Exception as e:
-            logger.debug(e)
+        candidates.sort(
+            key=lambda candidate: (
+                float(candidate["decision"].signal_score),
+                float(candidate["decision"].relative_strength or -999),
+            ),
+            reverse=True,
+        )
 
-    def getSuperTrend(self, symbol: str, length: int, factor: int, timeframe: str):
-        # Get the 1-day bars for the symbol
-        data_bars = self.alpaca.get_bars(symbol, timeframe, limit=length)
-        
-        # Calculate the super trend indicator
-        atr = (data_bars[0].h - data_bars[0].l) / data_bars[0].c
-        super_trend = (data_bars[0].h + data_bars[0].l) / 2 + length * atr * factor
-        
-        if data_bars:
-            if super_trend > data_bars[0].c:
-                return 'buy'
-            elif super_trend < data_bars[0].c:
-                return 'hold'
-            else:
-                return 'hold'
-        else:
-            logger.error(f'Data Bars: {data_bars}!')
+        for candidate in candidates:
+            if len(open_symbols) >= self.strategy_config.max_open_positions:
+                break
 
-    def botLoop(self):
-        bot = StockBot()
+            symbol = candidate["symbol"]
+            decision = candidate["decision"]
+            quantity, risk_budget, effective_risk_pct = self.position_size(equity, float(decision.entry_price), float(decision.stop_price))
+            if quantity < 1:
+                self.logger.info("Skipping %s: quantity calculated as zero.", symbol)
+                continue
+
+            self.submit_market_order(symbol, quantity, "buy")
+            open_symbols.append(symbol)
+            open_trades[symbol] = {
+                "entry_price": float(decision.entry_price),
+                "stop_price": float(decision.stop_price),
+                "take_profit_price": float(decision.take_profit_price),
+                "quantity": quantity,
+                "remaining_quantity": quantity,
+                "partial_exit_done": False,
+                "max_price": float(decision.entry_price),
+                "min_price": float(decision.entry_price),
+                "risk_per_share": float(decision.risk_per_share),
+                "atr_value": float(decision.atr_value or 0.0),
+                "signal_score": float(decision.signal_score),
+                "relative_strength": decision.relative_strength,
+            }
+            self.append_journal(
+                "entry",
+                symbol,
+                "buy",
+                quantity,
+                float(decision.entry_price),
+                decision.reason,
+                float(decision.atr_value or 0.0),
+                float(decision.stop_price),
+                risk_budget,
+                signal_score=float(decision.signal_score),
+                relative_strength=decision.relative_strength,
+                effective_risk_pct=effective_risk_pct,
+                market_regime=regime[1],
+                notes="ranked entry",
+            )
+
+    def run_cycle(self) -> None:
+        self.logger.info("Stocking Bot v%s running.", self.bot_version)
+        self.wait_for_market_open()
+        account = self.refresh_account()
+
+        if account.trading_blocked:
+            self.logger.warning("Account is currently restricted from trading.")
+            return
+
+        market_context = self.get_market_context()
+        live_positions = self.get_positions()
+        self.remove_closed_positions_from_state(live_positions)
+        self.manage_open_positions(live_positions, market_context)
+        time.sleep(1)
+        refreshed_account = self.refresh_account()
+        refreshed_positions = self.get_positions()
+        self.evaluate_new_entries(refreshed_account, refreshed_positions, market_context)
+        self.save_state()
+
+    def bot_loop(self) -> None:
         while True:
-            bot.run()
+            try:
+                self.run_cycle()
+            except (api.rest.APIError, ValueError, KeyError, TypeError) as exc:
+                self.logger.exception("Bot cycle failed: %s", exc)
             time.sleep(self.sleeper * 60)
 
-bot = StockBot()
-bot.botLoop()
+
+if __name__ == "__main__":
+    StockBot().bot_loop()

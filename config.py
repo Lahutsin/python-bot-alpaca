@@ -1,7 +1,7 @@
 # LIVE
-#ALPACA_KEY          = "YOUR ALPACA KEY"
-#ALPACA_SECRET_KEY   = "YOUR ALPACA SECRET KEY"
-#ALPACA_URL          = "https://api.alpaca.markets"
+# ALPACA_KEY          = "YOUR ALPACA KEY"
+# ALPACA_SECRET_KEY   = "YOUR ALPACA SECRET KEY"
+# ALPACA_URL          = "https://api.alpaca.markets"
 
 # TEST
 ALPACA_KEY           = "YOUR ALPACA KEY"
@@ -9,16 +9,15 @@ ALPACA_SECRET_KEY    = "YOUR ALPACA SECRET KEY"
 ALPACA_URL           = "https://paper-api.alpaca.markets"
 
 # STOCK LIST
-# Example: NAME_STOCK : PERCENT (%)
 ALPACA_STOCK_CONFIG  = {
-    'AAPL'  : 10.0,
-    'CMCSA' : 10.0,
-    'TSM'   : 10.0,
-    'BUD'   : 10.0
+    "AAPL": 10.0,
+    "CMCSA": 10.0,
+    "TSM": 10.0,
+    "BUD": 10.0,
 }
 
 # BOT LOOP
-ALPACA_SLEEP_TIMEOUT = 60 # minutes
+ALPACA_SLEEP_TIMEOUT = 60
 
 # MARKET REGIME
 ALPACA_MARKET_SYMBOL            = "SPY"
@@ -84,4 +83,4 @@ ALPACA_BACKTEST_PULLBACK_LIMIT  = 2500
 ALPACA_BACKTEST_ENTRY_LIMIT     = 8000
 
 # INFO
-ALPACA_STOCKING_BOT_VERSION = "0.4.0"
+ALPACA_STOCKING_BOT_VERSION     = "0.4.0"
