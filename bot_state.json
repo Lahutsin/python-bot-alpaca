@@ -1,0 +1,32 @@
+{
+  "open_trades": {
+    "XOM": {
+      "atr_value": 3.9425362554115235,
+      "entry_price": 163.535,
+      "max_price": 163.535,
+      "min_price": 163.535,
+      "partial_exit_done": false,
+      "quantity": 35,
+      "relative_strength": 0.34305253468170527,
+      "remaining_quantity": 35,
+      "risk_per_share": 14.095380438311707,
+      "signal_score": 8.08,
+      "stop_price": 149.4396195616883,
+      "take_profit_price": 177.6303804383117
+    }
+  },
+  "performance": {
+    "consecutive_losses": 0,
+    "paused_until": null
+  },
+  "risk_windows": {
+    "daily": {
+      "date": "2026-03-25",
+      "start_equity": 100000.0
+    },
+    "weekly": {
+      "start_equity": 100000.0,
+      "week": "2026-W13"
+    }
+  }
+}

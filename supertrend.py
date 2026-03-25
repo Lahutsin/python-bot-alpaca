@@ -5,7 +5,7 @@ import json
 from alpaca_trade_api import REST
 
 import config
-from indicators import bars_to_dataframe, supertrend
+from indicators import bars_start_for_timeframe, bars_to_dataframe, supertrend
 
 
 class SuperTrend:
@@ -17,7 +17,9 @@ class SuperTrend:
         self.multiplier = float(getattr(config, "ALPACA_SUPERTREND_MULTIPLIER", 3.0))
 
     def get_supertrend_signal(self, symbol: str) -> dict[str, float | int | str]:
-        bars = self.alpaca.get_bars(symbol, self.data_timeframe, limit=max(self.length * 5, 100))
+        limit = max(self.length * 5, 100)
+        start = bars_start_for_timeframe(self.data_timeframe, limit)
+        bars = self.alpaca.get_bars(symbol, self.data_timeframe, start=start, limit=limit)
         frame = bars_to_dataframe(bars)
         if frame.empty:
             return {"symbol": symbol, "signal": "no_data"}

@@ -13,11 +13,32 @@ import alpaca_trade_api as api
 import pandas as pd
 
 import config
-from indicators import bars_to_dataframe
+from indicators import bars_start_for_timeframe, bars_to_dataframe
 from strategy import StrategyConfig, StrategyEngine
 
 
 class StockBot:
+    JOURNAL_HEADER = [
+        "timestamp",
+        "event",
+        "symbol",
+        "side",
+        "quantity",
+        "price",
+        "reason",
+        "atr",
+        "stop_price",
+        "risk_amount",
+        "r_multiple",
+        "signal_score",
+        "relative_strength",
+        "effective_risk_pct",
+        "market_regime",
+        "mfe_r",
+        "mae_r",
+        "notes",
+    ]
+
     def __init__(self) -> None:
         self.alpaca = api.REST(config.ALPACA_KEY, config.ALPACA_SECRET_KEY, config.ALPACA_URL, "v2")
         self.symbols = config.ALPACA_STOCK_CONFIG
@@ -48,32 +69,27 @@ class StockBot:
         return self.state.setdefault("performance", {"consecutive_losses": 0, "paused_until": None})
 
     def ensure_journal_exists(self) -> None:
-        if self.journal_path.exists():
+        header_prefix = ",".join(self.JOURNAL_HEADER)
+        if not self.journal_path.exists():
+            with self.journal_path.open("w", encoding="utf-8", newline="") as file_pointer:
+                writer = csv.writer(file_pointer)
+                writer.writerow(self.JOURNAL_HEADER)
             return
-        with self.journal_path.open("w", encoding="utf-8", newline="") as file_pointer:
-            writer = csv.writer(file_pointer)
-            writer.writerow(
-                [
-                    "timestamp",
-                    "event",
-                    "symbol",
-                    "side",
-                    "quantity",
-                    "price",
-                    "reason",
-                    "atr",
-                    "stop_price",
-                    "risk_amount",
-                    "r_multiple",
-                    "signal_score",
-                    "relative_strength",
-                    "effective_risk_pct",
-                    "market_regime",
-                    "mfe_r",
-                    "mae_r",
-                    "notes",
-                ]
-            )
+
+        with self.journal_path.open("r", encoding="utf-8", newline="") as file_pointer:
+            existing_content = file_pointer.read()
+
+        if not existing_content:
+            with self.journal_path.open("w", encoding="utf-8", newline="") as file_pointer:
+                writer = csv.writer(file_pointer)
+                writer.writerow(self.JOURNAL_HEADER)
+            return
+
+        first_line = existing_content.splitlines()[0].strip()
+        if first_line != header_prefix:
+            with self.journal_path.open("w", encoding="utf-8", newline="") as file_pointer:
+                file_pointer.write(header_prefix + "\n")
+                file_pointer.write(existing_content)
 
     def append_journal(
         self,
@@ -120,6 +136,33 @@ class StockBot:
                 ]
             )
 
+    def append_entry_skip(
+        self,
+        symbol: str,
+        reason: str,
+        *,
+        price: float = 0.0,
+        signal_score: float = 0.0,
+        relative_strength: float | None = None,
+        market_regime: str = "",
+        notes: str = "",
+    ) -> None:
+        self.append_journal(
+            "entry_skip",
+            symbol,
+            "hold",
+            0,
+            price,
+            reason,
+            0.0,
+            0.0,
+            0.0,
+            signal_score=signal_score,
+            relative_strength=relative_strength,
+            market_regime=market_regime,
+            notes=notes,
+        )
+
     def refresh_account(self):
         return self.alpaca.get_account()
 
@@ -136,7 +179,8 @@ class StockBot:
             clock = self.alpaca.get_clock()
 
     def fetch_frame(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        bars = self.alpaca.get_bars(symbol, timeframe, limit=limit)
+        start = bars_start_for_timeframe(timeframe, limit)
+        bars = self.alpaca.get_bars(symbol, timeframe, start=start, limit=limit)
         return self.strategy.prepare_frame(bars_to_dataframe(bars))
 
     def get_mid_price(self, symbol: str, fallback_price: float | None = None) -> tuple[float, float | None]:
@@ -291,6 +335,25 @@ class StockBot:
             "relative_strength": None,
         }
 
+    def append_synced_entry(self, symbol: str, trade_state: dict[str, Any], market_regime_reason: str) -> None:
+        quantity = int(float(trade_state.get("quantity", 0)))
+        risk_per_share = float(trade_state.get("risk_per_share", 0.0))
+        self.append_journal(
+            "entry_sync",
+            symbol,
+            "buy",
+            quantity,
+            float(trade_state.get("entry_price", 0.0)),
+            f"{symbol}: synchronized existing broker position",
+            float(trade_state.get("atr_value", 0.0)),
+            float(trade_state.get("stop_price", 0.0)),
+            risk_per_share * quantity,
+            signal_score=float(trade_state.get("signal_score", 0.0)),
+            relative_strength=trade_state.get("relative_strength"),
+            market_regime=market_regime_reason,
+            notes="synced from live position",
+        )
+
     def mfe_mae_r(self, trade_state: dict[str, Any]) -> tuple[float, float]:
         risk_per_share = float(trade_state.get("risk_per_share", 0.0))
         if risk_per_share <= 0:
@@ -316,6 +379,7 @@ class StockBot:
             if trade_state is None:
                 trade_state = self.initialise_trade_state(position, daily_frame, current_price)
                 open_trades[symbol] = trade_state
+                self.append_synced_entry(symbol, trade_state, regime[1])
 
             trade_state["max_price"] = max(float(trade_state.get("max_price", current_price)), current_price)
             trade_state["min_price"] = min(float(trade_state.get("min_price", current_price)), current_price)
@@ -387,30 +451,41 @@ class StockBot:
         benchmark_frame = market_context["benchmark_frame"]
         equity = float(account.equity)
         open_symbols = list(live_positions.keys())
+        regime_ok, regime_reason = regime
+
+        if not regime_ok:
+            self.logger.info("Skipping new entries: %s", regime_reason)
+            self.append_entry_skip("PORTFOLIO", regime_reason, market_regime=regime_reason, notes="market regime gate")
+            return
 
         if len(open_symbols) >= self.strategy_config.max_open_positions:
             self.logger.info("Skipping new entries: max open positions reached.")
+            self.append_entry_skip("PORTFOLIO", "max open positions reached", market_regime=regime[1], notes="portfolio gate")
             return
 
         limits_hit, limits_reason = self.risk_limits_breached(equity)
         if limits_hit:
             self.logger.warning("Skipping new entries: %s", limits_reason)
+            self.append_entry_skip("PORTFOLIO", limits_reason, market_regime=regime[1], notes="risk gate")
             return
 
         paused, pause_reason = self.entries_paused()
         if paused:
             self.logger.warning("Skipping new entries: %s", pause_reason)
+            self.append_entry_skip("PORTFOLIO", pause_reason, market_regime=regime[1], notes="cooldown gate")
             return
 
         candidates: list[dict[str, Any]] = []
 
         for symbol in self.symbols:
             if symbol in live_positions or symbol in open_trades:
+                self.append_entry_skip(symbol, "position already open", market_regime=regime[1], notes="already tracked")
                 continue
 
             correlated_count = self.correlated_position_count(symbol, open_symbols)
             if correlated_count >= self.strategy_config.max_correlated_positions:
                 self.logger.info("Skipping %s: correlation limit reached.", symbol)
+                self.append_entry_skip(symbol, "correlation limit reached", market_regime=regime[1], notes=f"correlated positions: {correlated_count}")
                 continue
 
             daily_frame = self.fetch_frame(symbol, self.strategy_config.daily_timeframe, 260)
@@ -431,6 +506,15 @@ class StockBot:
             )
             if decision.action != "buy":
                 self.logger.info(decision.reason)
+                self.append_entry_skip(
+                    symbol,
+                    decision.reason,
+                    price=current_price,
+                    signal_score=float(decision.signal_score),
+                    relative_strength=decision.relative_strength,
+                    market_regime=decision.market_regime_reason or regime[1],
+                    notes="strategy rejected entry",
+                )
                 continue
 
             candidates.append(
@@ -457,6 +541,15 @@ class StockBot:
             quantity, risk_budget, effective_risk_pct = self.position_size(equity, float(decision.entry_price), float(decision.stop_price))
             if quantity < 1:
                 self.logger.info("Skipping %s: quantity calculated as zero.", symbol)
+                self.append_entry_skip(
+                    symbol,
+                    "quantity calculated as zero",
+                    price=float(decision.entry_price),
+                    signal_score=float(decision.signal_score),
+                    relative_strength=decision.relative_strength,
+                    market_regime=regime[1],
+                    notes="risk budget too small for stop distance",
+                )
                 continue
 
             self.submit_market_order(symbol, quantity, "buy")

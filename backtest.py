@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 import config
-from indicators import bars_to_dataframe
+from indicators import bars_start_for_timeframe, bars_to_dataframe
 from strategy import StrategyConfig, StrategyEngine
 
 
@@ -43,7 +43,8 @@ class TrendBacktester:
     def fetch_frame(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         cache_key = (symbol, timeframe, limit)
         if cache_key not in self.frame_cache:
-            bars = self.alpaca.get_bars(symbol, timeframe, limit=limit)
+            start = bars_start_for_timeframe(timeframe, limit)
+            bars = self.alpaca.get_bars(symbol, timeframe, start=start, limit=limit)
             self.frame_cache[cache_key] = self.strategy.prepare_frame(bars_to_dataframe(bars))
         return self.frame_cache[cache_key]
 

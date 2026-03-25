@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import numpy as np
@@ -28,6 +30,30 @@ def bars_to_dataframe(bars: Iterable) -> pd.DataFrame:
     frame = frame.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"])
     frame = frame.set_index("timestamp").sort_index()
     return frame
+
+
+def bars_start_for_timeframe(timeframe: str, limit: int, now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    timeframe = timeframe.strip()
+
+    if timeframe.endswith("Min"):
+        minutes_per_bar = max(1, int(timeframe[:-3]))
+        bars_per_session = max(1, math.floor(390 / minutes_per_bar))
+        trading_days = math.ceil(limit / bars_per_session) + 5
+        calendar_days = math.ceil(trading_days * 7 / 5) + 2
+    elif timeframe.endswith("Hour"):
+        hours_per_bar = max(1, int(timeframe[:-4]))
+        bars_per_session = max(1, math.floor(390 / (hours_per_bar * 60)))
+        trading_days = math.ceil(limit / bars_per_session) + 5
+        calendar_days = math.ceil(trading_days * 7 / 5) + 2
+    elif timeframe.endswith("Day"):
+        days_per_bar = max(1, int(timeframe[:-3]))
+        trading_days = limit * days_per_bar + 20
+        calendar_days = math.ceil(trading_days * 7 / 5) + 5
+    else:
+        calendar_days = max(limit * 3, 30)
+
+    return (now - timedelta(days=calendar_days)).isoformat()
 
 
 def ema(series: pd.Series, length: int) -> pd.Series:
