@@ -4,8 +4,8 @@
 # ALPACA_URL          = "https://api.alpaca.markets"
 
 # TEST
-ALPACA_KEY           = "PKG5QFYIX7J6PQXUMPCDH4TFCM"
-ALPACA_SECRET_KEY    = "9Cv1kAvLz3PdtY8Twp4rdGNruXtmBcsDDbCf7MQDNEHg"
+ALPACA_KEY           = "#"
+ALPACA_SECRET_KEY    = "#"
 ALPACA_URL           = "https://paper-api.alpaca.markets"
 
 # STOCK LIST
