@@ -290,18 +290,21 @@ class StockBot:
         consecutive_losses = int(self.performance_state().get("consecutive_losses", 0))
         return self.strategy.calculate_effective_risk_pct(equity, weekly_start, consecutive_losses)
 
-    def position_size(self, equity: float, entry_price: float, stop_price: float) -> tuple[int, float, float]:
-        risk_per_share = entry_price - stop_price
-        if risk_per_share <= 0:
+    def symbol_allocation_pct(self, symbol: str) -> float:
+        configured_pct = self.symbols.get(symbol, self.strategy_config.max_position_pct)
+        return max(0.0, float(configured_pct))
+
+    def position_size(self, symbol: str, equity: float, entry_price: float, stop_price: float) -> tuple[int, float, float]:
+        if entry_price <= 0:
             return 0, 0.0, 0.0
 
-        effective_risk_pct = self.effective_risk_pct(equity)
-        risk_budget = equity * (effective_risk_pct / 100)
-        max_position_value = equity * (self.strategy_config.max_position_pct / 100)
-        quantity_by_risk = math.floor(risk_budget / risk_per_share)
-        quantity_by_value = math.floor(max_position_value / entry_price)
-        quantity = max(0, min(quantity_by_risk, quantity_by_value))
-        return quantity, risk_budget, effective_risk_pct
+        risk_per_share = entry_price - stop_price
+        allocation_pct = self.symbol_allocation_pct(symbol)
+        target_position_value = equity * (allocation_pct / 100)
+        quantity = max(0, math.floor(target_position_value / entry_price))
+        actual_risk_amount = max(0.0, quantity * risk_per_share)
+        actual_risk_pct = ((actual_risk_amount / equity) * 100) if equity > 0 else 0.0
+        return quantity, actual_risk_amount, actual_risk_pct
 
     def get_positions(self) -> dict[str, Any]:
         return {position.symbol: position for position in self.alpaca.list_positions()}
@@ -563,7 +566,7 @@ class StockBot:
 
             symbol = candidate["symbol"]
             decision = candidate["decision"]
-            quantity, risk_budget, effective_risk_pct = self.position_size(equity, float(decision.entry_price), float(decision.stop_price))
+            quantity, risk_amount, effective_risk_pct = self.position_size(symbol, equity, float(decision.entry_price), float(decision.stop_price))
             if quantity < 1:
                 self.logger.info("Skipping %s: quantity calculated as zero.", symbol)
                 self.append_entry_skip(
@@ -602,7 +605,7 @@ class StockBot:
                 decision.reason,
                 float(decision.atr_value or 0.0),
                 float(decision.stop_price),
-                risk_budget,
+                        risk_amount,
                 signal_score=float(decision.signal_score),
                 relative_strength=decision.relative_strength,
                 effective_risk_pct=effective_risk_pct,

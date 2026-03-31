@@ -55,6 +55,13 @@ class StrategyConfig:
     min_relative_strength: float = 0.0
     min_entry_score: float = 5.5
     breakout_buffer_pct: float = 0.0
+    breakout_lookback_bars: int = 4
+    require_pullback_above_ema50: bool = False
+    require_entry_above_ema20: bool = False
+    require_entry_supertrend: bool = False
+    daily_exit_confirm_bars: int = 2
+    intraday_exit_confirm_bars: int = 2
+    break_even_trigger_r: float = 0.75
 
     @classmethod
     def from_module(cls, module: Any) -> "StrategyConfig":
@@ -104,6 +111,13 @@ class StrategyConfig:
             min_relative_strength=float(getattr(module, "ALPACA_MIN_RELATIVE_STRENGTH", cls.min_relative_strength)),
             min_entry_score=float(getattr(module, "ALPACA_MIN_ENTRY_SCORE", cls.min_entry_score)),
             breakout_buffer_pct=float(getattr(module, "ALPACA_BREAKOUT_BUFFER_PCT", cls.breakout_buffer_pct)),
+            breakout_lookback_bars=int(getattr(module, "ALPACA_BREAKOUT_LOOKBACK_BARS", cls.breakout_lookback_bars)),
+            require_pullback_above_ema50=bool(getattr(module, "ALPACA_REQUIRE_PULLBACK_ABOVE_EMA50", cls.require_pullback_above_ema50)),
+            require_entry_above_ema20=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_ABOVE_EMA20", cls.require_entry_above_ema20)),
+            require_entry_supertrend=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_SUPERTREND", cls.require_entry_supertrend)),
+            daily_exit_confirm_bars=int(getattr(module, "ALPACA_DAILY_EXIT_CONFIRM_BARS", cls.daily_exit_confirm_bars)),
+            intraday_exit_confirm_bars=int(getattr(module, "ALPACA_INTRADAY_EXIT_CONFIRM_BARS", cls.intraday_exit_confirm_bars)),
+            break_even_trigger_r=float(getattr(module, "ALPACA_BREAK_EVEN_TRIGGER_R", cls.break_even_trigger_r)),
         )
 
 
@@ -370,7 +384,16 @@ class StrategyEngine:
                 market_regime_reason=regime_reason,
             )
 
-        if previous_entry_row is None:
+        if self.config.require_pullback_above_ema50 and float(pullback_row["close"]) < float(pullback_row["ema_50"]):
+            return SignalDecision(
+                "hold",
+                f"{symbol}: pullback close below EMA50: close={self._fmt(pullback_row['close'])}, ema50={self._fmt(pullback_row['ema_50'])}",
+                relative_strength=relative_strength,
+                market_regime_reason=regime_reason,
+            )
+
+        breakout_lookback = max(1, self.config.breakout_lookback_bars)
+        if previous_entry_row is None or len(entry_frame) <= breakout_lookback:
             return SignalDecision(
                 "hold",
                 f"{symbol}: not enough entry bars: entry_bars={len(entry_frame)}",
@@ -378,14 +401,32 @@ class StrategyEngine:
                 market_regime_reason=regime_reason,
             )
 
-        breakout_threshold = float(previous_entry_row["high"]) * (1 - self.config.breakout_buffer_pct / 100)
+        breakout_reference = float(entry_frame.iloc[-breakout_lookback - 1 : -1]["high"].max())
+        breakout_threshold = breakout_reference * (1 + self.config.breakout_buffer_pct / 100)
         breakout = float(entry_row["close"]) >= breakout_threshold
         volume_ratio = float(entry_row["volume"] / entry_row["avg_volume_20"]) if entry_row["avg_volume_20"] and entry_row["avg_volume_20"] > 0 else 0.0
         volume_ok = volume_ratio >= self.config.volume_multiplier
+
+        if self.config.require_entry_above_ema20 and float(entry_row["close"]) < float(entry_row["ema_20"]):
+            return SignalDecision(
+                "hold",
+                f"{symbol}: entry close below EMA20: close={self._fmt(entry_row['close'])}, ema20={self._fmt(entry_row['ema_20'])}",
+                relative_strength=relative_strength,
+                market_regime_reason=regime_reason,
+            )
+
+        if self.config.require_entry_supertrend and int(entry_row["supertrend_direction"]) != 1:
+            return SignalDecision(
+                "hold",
+                f"{symbol}: entry supertrend not long: direction={int(entry_row['supertrend_direction'])}",
+                relative_strength=relative_strength,
+                market_regime_reason=regime_reason,
+            )
+
         if not breakout:
             return SignalDecision(
                 "hold",
-                f"{symbol}: no breakout on {self.config.entry_timeframe}: close={self._fmt(entry_row['close'])}, threshold={breakout_threshold:.2f}, prior_high={self._fmt(previous_entry_row['high'])}, buffer_pct={self.config.breakout_buffer_pct:.2f}",
+                f"{symbol}: no breakout on {self.config.entry_timeframe}: close={self._fmt(entry_row['close'])}, threshold={breakout_threshold:.2f}, lookback_high={breakout_reference:.2f}, lookback_bars={breakout_lookback}, buffer_pct={self.config.breakout_buffer_pct:.2f}",
                 relative_strength=relative_strength,
                 market_regime_reason=regime_reason,
             )
@@ -455,19 +496,29 @@ class StrategyEngine:
 
         daily_row = daily_frame.iloc[-1]
         pullback_row = pullback_frame.iloc[-1]
+        daily_confirm_bars = max(1, self.config.daily_exit_confirm_bars)
+        previous_daily_rows = daily_frame.iloc[-daily_confirm_bars:] if len(daily_frame) >= daily_confirm_bars else daily_frame
+        previous_pullback_rows = pullback_frame.iloc[-self.config.intraday_exit_confirm_bars :] if len(pullback_frame) >= self.config.intraday_exit_confirm_bars else pullback_frame
 
         stored_stop = float(trade_state["stop_price"])
         atr_value = float(daily_row["atr"]) if not pd.isna(daily_row["atr"]) else trade_state.get("atr_value", 0.0)
         max_price = max(float(trade_state.get("max_price", current_price)), current_price)
+        entry_price = float(trade_state.get("entry_price", current_price))
+        risk_per_share = max(float(trade_state.get("risk_per_share", 0.0)), 0.0)
+        trade_in_profit = current_price >= entry_price
         trailing_stop = max(
             stored_stop,
             max_price - atr_value * self.config.atr_trailing_multiplier if atr_value > 0 else stored_stop,
             float(daily_row["supertrend"]) if daily_row["supertrend_direction"] == 1 else stored_stop,
         )
 
+        if risk_per_share > 0 and max_price >= entry_price + risk_per_share * self.config.break_even_trigger_r:
+            trailing_stop = max(trailing_stop, entry_price)
+
         regime_ok, regime_reason = market_regime
-        if current_price <= stored_stop:
-            return SignalDecision("sell", f"{symbol}: hard stop hit", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
+        if current_price <= trailing_stop:
+            stop_reason = "hard stop hit" if trailing_stop <= stored_stop else "trailing stop hit"
+            return SignalDecision("sell", f"{symbol}: {stop_reason}", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
 
         if not regime_ok:
             return SignalDecision("sell", f"{symbol}: {regime_reason}", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
@@ -475,11 +526,16 @@ class StrategyEngine:
         if self.config.require_daily_supertrend and daily_row["supertrend_direction"] != 1:
             return SignalDecision("sell", f"{symbol}: daily supertrend flipped", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
 
-        if daily_row["close"] < daily_row["ema_50"]:
-            return SignalDecision("sell", f"{symbol}: daily close below EMA50", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
+        if len(previous_daily_rows) >= daily_confirm_bars:
+            closes_below_daily_ema50 = all(float(row["close"]) < float(row["ema_50"]) for _, row in previous_daily_rows.iterrows())
+            if closes_below_daily_ema50 and (trade_state.get("partial_exit_done") or trade_in_profit):
+                return SignalDecision("sell", f"{symbol}: confirmed daily close below EMA50", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
 
-        if pullback_row["close"] < pullback_row["ema_50"]:
-            return SignalDecision("sell", f"{symbol}: intraday close below EMA50", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
+        confirm_bars = max(1, self.config.intraday_exit_confirm_bars)
+        if len(previous_pullback_rows) >= confirm_bars:
+            closes_below_ema50 = all(float(row["close"]) < float(row["ema_50"]) for _, row in previous_pullback_rows.iterrows())
+            if closes_below_ema50 and int(pullback_row["supertrend_direction"]) != 1 and (trade_state.get("partial_exit_done") or trade_in_profit):
+                return SignalDecision("sell", f"{symbol}: confirmed intraday trend break", stop_price=stored_stop, trailing_stop_price=trailing_stop, atr_value=atr_value, market_regime_reason=regime_reason)
 
         if not trade_state.get("partial_exit_done") and current_price >= float(trade_state["take_profit_price"]):
             return SignalDecision("partial_sell", f"{symbol}: first target reached", stop_price=stored_stop, trailing_stop_price=max(trailing_stop, float(trade_state["entry_price"])), atr_value=atr_value, market_regime_reason=regime_reason)

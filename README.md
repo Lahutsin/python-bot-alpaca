@@ -98,6 +98,14 @@ Run the historical backtest and walk-forward report:
 python backtest.py
 ```
 
+By default, the backtest now prints a terminal summary with per-symbol scorecards, ASCII bars, walk-forward stats and a simple readiness assessment.
+
+If you still need the raw machine-readable report:
+
+```bash
+python backtest.py --json
+```
+
 ## Output Files
 
 - `debug.log`: bot runtime log.
