@@ -70,6 +70,22 @@ Start the live bot:
 python main.py
 ```
 
+Run in Docker Compose with persistent logs and runtime files stored on a mounted volume:
+
+```bash
+docker compose up -d --build
+```
+
+Compose mounts `./data` into the container at `/app/data` and writes these files there:
+
+- `debug.log`
+- `bot_state.json`
+- `trade_journal.csv`
+- `bot_heartbeat.json`
+
+The container uses environment overrides for runtime paths, so your broker credentials can remain in `config.py`.
+The service also includes a Docker healthcheck that validates a fresh heartbeat file from the bot loop.
+
 Inspect current SuperTrend values:
 
 ```bash
@@ -88,3 +104,9 @@ python backtest.py
 - `trade_journal.csv`: entries, partial exits and full exits with risk metrics.
 - `trade_journal.csv`: entries, partial exits and full exits with signal score, relative strength, effective risk and MFE/MAE in R.
 - `bot_state.json`: persistent open-trade state used for trailing and partial exits.
+- `bot_heartbeat.json`: heartbeat timestamp used by Docker healthcheck.
+
+## Docker Files
+
+- `Dockerfile`: builds the bot image.
+- `docker-compose.yml`: starts the bot and mounts `./data` for persistent runtime files.

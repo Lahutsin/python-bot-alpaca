@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import math
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,13 @@ class StockBot:
         "notes",
     ]
 
+    @staticmethod
+    def resolve_runtime_path(env_name: str, config_name: str, default_value: str) -> Path:
+        configured_value = os.getenv(env_name) or getattr(config, config_name, default_value)
+        path = Path(configured_value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def __init__(self) -> None:
         self.alpaca = api.REST(config.ALPACA_KEY, config.ALPACA_SECRET_KEY, config.ALPACA_URL, "v2")
         self.symbols = config.ALPACA_STOCK_CONFIG
@@ -46,14 +54,31 @@ class StockBot:
         self.sleeper = int(config.ALPACA_SLEEP_TIMEOUT)
         self.strategy_config = StrategyConfig.from_module(config)
         self.strategy = StrategyEngine(self.strategy_config)
-        self.state_path = Path(getattr(config, "ALPACA_STATE_PATH", "bot_state.json"))
-        self.journal_path = Path(getattr(config, "ALPACA_TRADE_JOURNAL", "trade_journal.csv"))
+        self.state_path = self.resolve_runtime_path("ALPACA_STATE_PATH", "ALPACA_STATE_PATH", "bot_state.json")
+        self.journal_path = self.resolve_runtime_path("ALPACA_TRADE_JOURNAL", "ALPACA_TRADE_JOURNAL", "trade_journal.csv")
+        self.log_path = self.resolve_runtime_path("ALPACA_LOG_PATH", "ALPACA_LOG_PATH", "debug.log")
+        self.heartbeat_path = self.resolve_runtime_path("ALPACA_HEARTBEAT_PATH", "ALPACA_HEARTBEAT_PATH", "bot_heartbeat.json")
 
         log_format = "%(levelname)s %(asctime)s - %(message)s"
-        logging.basicConfig(filename="debug.log", filemode="a", format=log_format, level=logging.INFO)
+        logging.basicConfig(filename=self.log_path, filemode="a", format=log_format, level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         self.state = self.load_state()
         self.ensure_journal_exists()
+        self.write_heartbeat("starting")
+
+    def write_heartbeat(self, status: str, error: str = "") -> None:
+        payload = {
+            "updated_at": datetime.utcnow().isoformat(),
+            "pid": os.getpid(),
+            "status": status,
+            "bot_version": self.bot_version,
+            "sleep_timeout_minutes": self.sleeper,
+            "error": error,
+        }
+        temp_path = self.heartbeat_path.with_suffix(self.heartbeat_path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as file_pointer:
+            json.dump(payload, file_pointer, indent=2, sort_keys=True)
+        temp_path.replace(self.heartbeat_path)
 
     def load_state(self) -> dict[str, Any]:
         if self.state_path.exists():
@@ -586,6 +611,7 @@ class StockBot:
             )
 
     def run_cycle(self) -> None:
+        self.write_heartbeat("running")
         self.logger.info("Stocking Bot v%s running.", self.bot_version)
         self.wait_for_market_open()
         account = self.refresh_account()
@@ -603,13 +629,16 @@ class StockBot:
         refreshed_positions = self.get_positions()
         self.evaluate_new_entries(refreshed_account, refreshed_positions, market_context)
         self.save_state()
+        self.write_heartbeat("sleeping")
 
     def bot_loop(self) -> None:
         while True:
             try:
                 self.run_cycle()
             except (api.rest.APIError, ValueError, KeyError, TypeError) as exc:
+                self.write_heartbeat("error", str(exc))
                 self.logger.exception("Bot cycle failed: %s", exc)
+            self.write_heartbeat("sleeping")
             time.sleep(self.sleeper * 60)
 
 

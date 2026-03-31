@@ -86,8 +86,10 @@ ALPACA_PARTIAL_TAKE_PROFIT_R    = 1.0
 ALPACA_PARTIAL_EXIT_PCT         = 0.5
 
 # FILES
+ALPACA_LOG_PATH                 = "debug.log"
 ALPACA_STATE_PATH               = "bot_state.json"
 ALPACA_TRADE_JOURNAL            = "trade_journal.csv"
+ALPACA_HEARTBEAT_PATH           = "bot_heartbeat.json"
 
 # BACKTEST
 ALPACA_BACKTEST_INITIAL_EQUITY  = 100000

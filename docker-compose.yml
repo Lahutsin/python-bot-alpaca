@@ -1,0 +1,20 @@
+services:
+  alpaca-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alpaca-bot
+    restart: unless-stopped
+    environment:
+      ALPACA_LOG_PATH: /app/data/debug.log
+      ALPACA_STATE_PATH: /app/data/bot_state.json
+      ALPACA_TRADE_JOURNAL: /app/data/trade_journal.csv
+      ALPACA_HEARTBEAT_PATH: /app/data/bot_heartbeat.json
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
