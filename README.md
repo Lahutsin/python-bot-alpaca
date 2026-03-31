@@ -98,12 +98,24 @@ Run the historical backtest and walk-forward report:
 python backtest.py
 ```
 
+Backtest history is cached on disk under `data/backtest_cache` by default, so repeated runs reuse previously downloaded Alpaca bars instead of fetching them again every time.
+You can override the location with `ALPACA_BACKTEST_CACHE_DIR` in config or environment.
+
 By default, the backtest now prints a terminal summary with per-symbol scorecards, ASCII bars, walk-forward stats and a simple readiness assessment.
+Each completed trade now also carries an entry-time filter snapshot with the key metrics and thresholds used to approve the setup.
 
 If you still need the raw machine-readable report:
 
 ```bash
 python backtest.py --json
+```
+
+The JSON report includes these per-trade values under `entry_filters`, and the terminal summary prints a compact `ENTRY FILTER SNAPSHOTS` table for quick inspection.
+
+If you want to force a fresh download and overwrite the saved cache:
+
+```bash
+python backtest.py --refresh-cache
 ```
 
 ## Output Files

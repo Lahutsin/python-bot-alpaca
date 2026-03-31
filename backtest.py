@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import alpaca_trade_api as api
@@ -139,6 +141,12 @@ def format_date_label(value: str | None) -> str:
     return pd.Timestamp(value).strftime("%Y-%m-%d")
 
 
+def format_datetime_label(value: str | None) -> str:
+    if not value:
+        return "n/a"
+    return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M")
+
+
 def report_period(report_data: dict[str, Any]) -> tuple[str | None, str | None]:
     period = report_data.get("period", {})
     return period.get("start"), period.get("end")
@@ -151,6 +159,32 @@ def exit_reason_summary(report_data: dict[str, Any]) -> list[tuple[str, int]]:
             exit_reason = str(reason_trade.get("exit_reason", "unknown"))
             reason_counts[exit_reason] = reason_counts.get(exit_reason, 0) + 1
     return sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)
+
+
+def trade_filter_rows(report_data: dict[str, Any]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for symbol, symbol_payload in report_data["symbols"].items():
+        for trade in symbol_payload.get("trades", []):
+            entry_filters = trade.get("entry_filters") or {}
+            breakout_threshold = float(entry_filters.get("breakout_threshold", 0.0) or 0.0)
+            breakout_close = float(entry_filters.get("breakout_close", 0.0) or 0.0)
+            breakout_gap_pct = ((breakout_close / breakout_threshold) - 1) * 100 if breakout_threshold > 0 else 0.0
+            rows.append(
+                [
+                    symbol,
+                    format_datetime_label(trade.get("entry_time")),
+                    f"{float(entry_filters.get('signal_score', trade.get('signal_score', 0.0))):.2f}/{float(entry_filters.get('min_entry_score', 0.0)):.2f}",
+                    f"{float(entry_filters.get('relative_strength', trade.get('relative_strength', 0.0)) or 0.0):.3f}/{float(entry_filters.get('min_relative_strength', 0.0)):.3f}",
+                    f"{float(entry_filters.get('adx', 0.0)):.1f}/{float(entry_filters.get('adx_threshold', 0.0)):.1f}",
+                    f"{float(entry_filters.get('rsi', 0.0)):.1f}/{float(entry_filters.get('max_entry_rsi', 0.0)):.1f}",
+                    f"{float(entry_filters.get('extension_atr', 0.0)):.2f}/{float(entry_filters.get('max_extension_atr', 0.0)):.2f}",
+                    f"{float(entry_filters.get('volume_ratio', 0.0)):.2f}/{float(entry_filters.get('min_volume_ratio', 0.0)):.2f}",
+                    f"{breakout_gap_pct:.2f}%",
+                    f"{format_float(float(entry_filters.get('allowed_spread_pct', 0.0)))}%",
+                ]
+            )
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return rows
 
 
 def readiness_notes(summary: dict[str, float]) -> list[str]:
@@ -248,6 +282,13 @@ def print_terminal_report(report_data: dict[str, Any], initial_equity: float) ->
             print(f"{count:>4}  {reason}")
         print()
 
+    trade_rows = trade_filter_rows(report_data)
+    if trade_rows:
+        print("ENTRY FILTER SNAPSHOTS")
+        trade_headers = ["Symbol", "Entry", "Score", "RS", "ADX", "RSI", "ExtATR", "Vol", "BO%", "Spread"]
+        print_table(trade_headers, trade_rows)
+        print()
+
     print("READINESS")
     for note in readiness_notes(summary):
         print(f"- {note}")
@@ -256,11 +297,13 @@ def print_terminal_report(report_data: dict[str, Any], initial_equity: float) ->
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the historical backtest and walk-forward report.")
     parser.add_argument("--json", action="store_true", help="Print the raw JSON report instead of the terminal summary.")
+    parser.add_argument("--refresh-cache", action="store_true", help="Ignore saved backtest history and fetch fresh bars from Alpaca.")
     return parser.parse_args()
 
 
 @dataclass
 class TradeRecord:
+    symbol: str
     entry_time: str
     exit_time: str
     entry_price: float
@@ -274,10 +317,67 @@ class TradeRecord:
     mfe_r: float
     mae_r: float
     exit_reason: str
+    entry_filters: dict[str, Any]
+
+
+@dataclass
+class EntryFilterSnapshot:
+    market_regime_ok: bool
+    market_regime_reason: str
+    spread_pct: float | None
+    allowed_spread_pct: float
+    avg_dollar_volume_20: float
+    min_avg_daily_dollar_volume: float
+    daily_close: float
+    daily_ema_50: float
+    daily_ema_200: float
+    stock_ema_threshold: float
+    daily_supertrend_direction: int
+    require_daily_supertrend: bool
+    adx: float
+    adx_threshold: float
+    atr: float
+    rsi: float
+    max_entry_rsi: float
+    extension_atr: float
+    max_extension_atr: float
+    relative_strength: float | None
+    min_relative_strength: float
+    pullback_close: float
+    pullback_low: float
+    pullback_ema_20: float
+    pullback_ema_50: float
+    pullback_touched: bool
+    require_pullback_above_ema50: bool
+    entry_close: float
+    entry_ema_20: float
+    entry_supertrend_direction: int
+    require_entry_above_ema20: bool
+    require_entry_supertrend: bool
+    breakout_reference: float
+    breakout_threshold: float
+    breakout_close: float
+    breakout_buffer_pct: float
+    volume_ratio: float
+    min_volume_ratio: float
+    signal_score: float
+    min_entry_score: float
 
 
 class TrendBacktester:
-    def __init__(self) -> None:
+    @staticmethod
+    def resolve_cache_dir() -> Path:
+        configured_value = os.getenv("ALPACA_BACKTEST_CACHE_DIR") or getattr(config, "ALPACA_BACKTEST_CACHE_DIR", "data/backtest_cache")
+        cache_dir = Path(configured_value)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    @staticmethod
+    def cache_file_path(cache_dir: Path, symbol: str, timeframe: str, limit: int) -> Path:
+        safe_timeframe = "".join(character.lower() if character.isalnum() else "_" for character in timeframe).strip("_")
+        return cache_dir / symbol.upper() / f"{safe_timeframe}_{limit}.csv"
+
+    def __init__(self, refresh_cache: bool = False) -> None:
         self.alpaca = api.REST(config.ALPACA_KEY, config.ALPACA_SECRET_KEY, config.ALPACA_URL, "v2")
         self.strategy_config = StrategyConfig.from_module(config)
         self.strategy = StrategyEngine(self.strategy_config)
@@ -286,7 +386,103 @@ class TrendBacktester:
         self.daily_limit = int(getattr(config, "ALPACA_BACKTEST_DAILY_LIMIT", 900))
         self.pullback_limit = int(getattr(config, "ALPACA_BACKTEST_PULLBACK_LIMIT", 2500))
         self.entry_limit = int(getattr(config, "ALPACA_BACKTEST_ENTRY_LIMIT", 8000))
+        self.backtest_cache_dir = self.resolve_cache_dir()
+        self.refresh_cache = refresh_cache
         self.frame_cache: dict[tuple[str, str, int], pd.DataFrame] = {}
+
+    def load_cached_frame(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
+        cache_path = self.cache_file_path(self.backtest_cache_dir, symbol, timeframe, limit)
+        if not cache_path.exists() or self.refresh_cache:
+            return None
+
+        try:
+            cached_frame = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        except (OSError, ValueError, pd.errors.ParserError):
+            return None
+
+        cached_frame.index = pd.to_datetime(cached_frame.index, utc=True)
+        return cached_frame.sort_index()
+
+    def build_entry_filter_snapshot(
+        self,
+        daily_frame: pd.DataFrame,
+        pullback_frame: pd.DataFrame,
+        entry_frame: pd.DataFrame,
+        market_regime: tuple[bool, str],
+        decision: Any,
+        spread_pct: float | None,
+        benchmark_daily: pd.DataFrame | None,
+    ) -> EntryFilterSnapshot:
+        daily_row = daily_frame.iloc[-1]
+        pullback_row = pullback_frame.iloc[-1]
+        entry_row = entry_frame.iloc[-1]
+        relative_strength = decision.relative_strength
+        if relative_strength is None:
+            relative_strength = self.strategy.compute_relative_strength(daily_frame, benchmark_daily)
+
+        stock_buffer_multiplier = 1 - (self.strategy_config.stock_trend_ema_buffer_pct / 100)
+        stock_ema_threshold = float(daily_row["ema_200"]) * stock_buffer_multiplier
+        tolerance = self.strategy_config.pullback_tolerance_pct / 100
+        touched_pullback_zone = (
+            pullback_row["low"] <= pullback_row["ema_20"] * (1 + tolerance)
+            or pullback_row["low"] <= pullback_row["ema_50"] * (1 + tolerance)
+        )
+        breakout_lookback = max(1, self.strategy_config.breakout_lookback_bars)
+        breakout_reference = float(entry_frame.iloc[-breakout_lookback - 1 : -1]["high"].max())
+        breakout_threshold = breakout_reference * (1 + self.strategy_config.breakout_buffer_pct / 100)
+        volume_ratio = float(entry_row["volume"] / entry_row["avg_volume_20"]) if entry_row["avg_volume_20"] and entry_row["avg_volume_20"] > 0 else 0.0
+        extension_atr = float((daily_row["close"] - daily_row["ema_20"]) / daily_row["atr"])
+        signal_score = float(decision.signal_score)
+
+        return EntryFilterSnapshot(
+            market_regime_ok=bool(market_regime[0]),
+            market_regime_reason=str(market_regime[1]),
+            spread_pct=spread_pct,
+            allowed_spread_pct=float(self.strategy.allowed_spread_pct(daily_row)),
+            avg_dollar_volume_20=float(daily_row["avg_dollar_volume_20"]),
+            min_avg_daily_dollar_volume=float(self.strategy_config.min_avg_daily_dollar_volume),
+            daily_close=float(daily_row["close"]),
+            daily_ema_50=float(daily_row["ema_50"]),
+            daily_ema_200=float(daily_row["ema_200"]),
+            stock_ema_threshold=stock_ema_threshold,
+            daily_supertrend_direction=int(daily_row["supertrend_direction"]),
+            require_daily_supertrend=bool(self.strategy_config.require_daily_supertrend),
+            adx=float(daily_row["adx"]),
+            adx_threshold=float(self.strategy_config.adx_threshold),
+            atr=float(daily_row["atr"]),
+            rsi=float(daily_row["rsi"]),
+            max_entry_rsi=float(self.strategy_config.max_entry_rsi),
+            extension_atr=extension_atr,
+            max_extension_atr=float(self.strategy_config.max_extension_atr),
+            relative_strength=None if relative_strength is None else float(relative_strength),
+            min_relative_strength=float(self.strategy_config.min_relative_strength),
+            pullback_close=float(pullback_row["close"]),
+            pullback_low=float(pullback_row["low"]),
+            pullback_ema_20=float(pullback_row["ema_20"]),
+            pullback_ema_50=float(pullback_row["ema_50"]),
+            pullback_touched=bool(touched_pullback_zone),
+            require_pullback_above_ema50=bool(self.strategy_config.require_pullback_above_ema50),
+            entry_close=float(entry_row["close"]),
+            entry_ema_20=float(entry_row["ema_20"]),
+            entry_supertrend_direction=int(entry_row["supertrend_direction"]),
+            require_entry_above_ema20=bool(self.strategy_config.require_entry_above_ema20),
+            require_entry_supertrend=bool(self.strategy_config.require_entry_supertrend),
+            breakout_reference=breakout_reference,
+            breakout_threshold=breakout_threshold,
+            breakout_close=float(entry_row["close"]),
+            breakout_buffer_pct=float(self.strategy_config.breakout_buffer_pct),
+            volume_ratio=volume_ratio,
+            min_volume_ratio=float(self.strategy_config.volume_multiplier),
+            signal_score=signal_score,
+            min_entry_score=float(self.strategy_config.min_entry_score),
+        )
+
+    def save_cached_frame(self, symbol: str, timeframe: str, limit: int, frame: pd.DataFrame) -> None:
+        cache_path = self.cache_file_path(self.backtest_cache_dir, symbol, timeframe, limit)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        frame.to_csv(temp_path)
+        temp_path.replace(cache_path)
 
     def default_backtest_period(self, entry_frame: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
         active_end = pd.Timestamp(entry_frame.index[-1])
@@ -300,9 +496,13 @@ class TrendBacktester:
     def fetch_frame(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         cache_key = (symbol, timeframe, limit)
         if cache_key not in self.frame_cache:
-            start = bars_start_for_timeframe(timeframe, limit)
-            bars = self.alpaca.get_bars(symbol, timeframe, start=start, limit=limit)
-            self.frame_cache[cache_key] = self.strategy.prepare_frame(bars_to_dataframe(bars))
+            cached_frame = self.load_cached_frame(symbol, timeframe, limit)
+            if cached_frame is None:
+                start = bars_start_for_timeframe(timeframe, limit)
+                bars = self.alpaca.get_bars(symbol, timeframe, start=start, limit=limit)
+                cached_frame = self.strategy.prepare_frame(bars_to_dataframe(bars))
+                self.save_cached_frame(symbol, timeframe, limit, cached_frame)
+            self.frame_cache[cache_key] = cached_frame
         return self.frame_cache[cache_key]
 
     def symbol_allocation_pct(self, symbol: str) -> float:
@@ -358,6 +558,7 @@ class TrendBacktester:
         mfe_r = (float(open_trade["max_price"]) - float(open_trade["entry_price"])) / float(open_trade["risk_per_share"])
         mae_r = (float(open_trade["entry_price"]) - float(open_trade["min_price"])) / float(open_trade["risk_per_share"])
         return TradeRecord(
+            symbol=str(open_trade["symbol"]),
             entry_time=open_trade["entry_time"],
             exit_time=str(timestamp),
             entry_price=float(open_trade["entry_price"]),
@@ -371,6 +572,7 @@ class TrendBacktester:
             mfe_r=mfe_r,
             mae_r=mae_r,
             exit_reason=exit_reason,
+            entry_filters=asdict(open_trade["entry_filters"]),
         )
 
     def update_performance_state(self, performance: dict[str, Any], r_multiple: float) -> None:
@@ -445,7 +647,17 @@ class TrendBacktester:
                     target_position_value = equity * (allocation_pct / 100)
                     quantity = int(target_position_value / price)
                     if quantity > 0:
+                        entry_filters = self.build_entry_filter_snapshot(
+                            daily_slice,
+                            pullback_slice,
+                            entry_slice,
+                            market_regime,
+                            decision,
+                            spread_pct=0.0,
+                            benchmark_daily=benchmark_slice,
+                        )
                         open_trade = {
+                            "symbol": symbol,
                             "entry_time": str(timestamp),
                             "entry_price": price,
                             "stop_price": float(decision.stop_price),
@@ -459,6 +671,7 @@ class TrendBacktester:
                             "min_price": price,
                             "signal_score": float(decision.signal_score),
                             "relative_strength": decision.relative_strength,
+                            "entry_filters": entry_filters,
                         }
                         bars_held = 0
             else:
@@ -558,7 +771,7 @@ class TrendBacktester:
 if __name__ == "__main__":
     args = parse_args()
     symbols = list(config.ALPACA_STOCK_CONFIG.keys())
-    runner = TrendBacktester()
+    runner = TrendBacktester(refresh_cache=args.refresh_cache)
     report = {
         "symbols": {symbol: runner.run_symbol_backtest(symbol) for symbol in symbols},
         "walk_forward": {symbol: runner.walk_forward_analysis(symbol) for symbol in symbols},
