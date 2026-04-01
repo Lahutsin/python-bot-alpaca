@@ -123,6 +123,23 @@ def session_vwap(frame: pd.DataFrame) -> pd.Series:
     return cumulative_value / cumulative_volume
 
 
+def anchored_vwap(frame: pd.DataFrame, anchor_timestamp: pd.Timestamp | None) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype="float64")
+
+    if anchor_timestamp is None:
+        return pd.Series(np.nan, index=frame.index, dtype="float64")
+
+    anchor_timestamp = pd.Timestamp(anchor_timestamp)
+    anchor_mask = frame.index >= anchor_timestamp
+    typical_price = (frame["high"] + frame["low"] + frame["close"]) / 3
+    typical_value = (typical_price * frame["volume"]).where(anchor_mask, 0.0)
+    anchored_volume = frame["volume"].where(anchor_mask, 0.0)
+    cumulative_value = typical_value.cumsum()
+    cumulative_volume = anchored_volume.cumsum().replace(0, np.nan)
+    return cumulative_value / cumulative_volume
+
+
 def supertrend(frame: pd.DataFrame, length: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
     average_true_range = atr(frame, length)
     hl2 = (frame["high"] + frame["low"]) / 2

@@ -169,6 +169,7 @@ def trade_filter_rows(report_data: dict[str, Any]) -> list[list[str]]:
             breakout_threshold = float(entry_filters.get("breakout_threshold", 0.0) or 0.0)
             breakout_close = float(entry_filters.get("breakout_close", 0.0) or 0.0)
             breakout_gap_pct = ((breakout_close / breakout_threshold) - 1) * 100 if breakout_threshold > 0 else 0.0
+            anchored_vwap_value = entry_filters.get("entry_anchored_vwap")
             rows.append(
                 [
                     symbol,
@@ -180,7 +181,9 @@ def trade_filter_rows(report_data: dict[str, Any]) -> list[list[str]]:
                     f"{float(entry_filters.get('extension_atr', 0.0)):.2f}/{float(entry_filters.get('max_extension_atr', 0.0)):.2f}",
                     f"{float(entry_filters.get('volume_ratio', 0.0)):.2f}/{float(entry_filters.get('min_volume_ratio', 0.0)):.2f}",
                     f"{float(entry_filters.get('entry_close', 0.0)):.2f}/{float(entry_filters.get('entry_vwap', 0.0)):.2f}",
+                    f"{float(entry_filters.get('entry_close', 0.0)):.2f}/{float(anchored_vwap_value):.2f}" if anchored_vwap_value is not None else f"{float(entry_filters.get('entry_close', 0.0)):.2f}/n/a",
                     f"{float(entry_filters.get('entry_vwap_delta_pct', 0.0) or 0.0):.2f}%",
+                    f"{float(entry_filters.get('entry_anchored_vwap_delta_pct', 0.0) or 0.0):.2f}%",
                     f"{breakout_gap_pct:.2f}%",
                     f"{format_float(float(entry_filters.get('allowed_spread_pct', 0.0)))}%",
                 ]
@@ -287,7 +290,7 @@ def print_terminal_report(report_data: dict[str, Any], initial_equity: float) ->
     trade_rows = trade_filter_rows(report_data)
     if trade_rows:
         print("ENTRY FILTER SNAPSHOTS")
-        trade_headers = ["Symbol", "Entry", "Score", "RS", "ADX", "RSI", "ExtATR", "Vol", "Px/VWAP", "VWAPd", "BO%", "Spread"]
+        trade_headers = ["Symbol", "Entry", "Score", "RS", "ADX", "RSI", "ExtATR", "Vol", "Px/VWAP", "Px/AVWAP", "VWAPd", "AVWAPd", "BO%", "Spread"]
         print_table(trade_headers, trade_rows)
         print()
 
@@ -357,11 +360,17 @@ class EntryFilterSnapshot:
     entry_vwap_threshold: float
     entry_vwap_prev: float | None
     entry_vwap_delta_pct: float | None
+    entry_anchored_vwap: float | None
+    entry_anchored_vwap_prev: float | None
+    entry_anchored_vwap_delta_pct: float | None
+    anchored_vwap_anchor_time: str | None
     entry_supertrend_direction: int
     require_entry_above_ema20: bool
     require_entry_supertrend: bool
     require_entry_above_vwap: bool
     require_rising_entry_vwap: bool
+    require_entry_above_anchored_vwap: bool
+    require_rising_anchored_vwap: bool
     entry_vwap_buffer_pct: float
     breakout_reference: float
     breakout_threshold: float
@@ -442,6 +451,16 @@ class TrendBacktester:
         volume_ratio = float(entry_row["volume"] / entry_row["avg_volume_20"]) if entry_row["avg_volume_20"] and entry_row["avg_volume_20"] > 0 else 0.0
         extension_atr = float((daily_row["close"] - daily_row["ema_20"]) / daily_row["atr"])
         entry_vwap = float(entry_row["vwap"]) if not pd.isna(entry_row.get("vwap")) else float("nan")
+        anchored_vwap_anchor_time, anchored_vwap_series = self.strategy.compute_entry_anchored_vwap(pullback_frame, entry_frame)
+        entry_anchored_vwap = float(anchored_vwap_series.iloc[-1]) if not anchored_vwap_series.empty and not pd.isna(anchored_vwap_series.iloc[-1]) else None
+        previous_entry_anchored_vwap = None
+        entry_anchored_vwap_delta_pct = None
+        if len(anchored_vwap_series) > 1:
+            previous_anchored_vwap_value = anchored_vwap_series.iloc[-2]
+            if not pd.isna(previous_anchored_vwap_value):
+                previous_entry_anchored_vwap = float(previous_anchored_vwap_value)
+                if previous_entry_anchored_vwap != 0 and entry_anchored_vwap is not None:
+                    entry_anchored_vwap_delta_pct = ((entry_anchored_vwap / previous_entry_anchored_vwap) - 1) * 100
         previous_entry_vwap = None
         entry_vwap_delta_pct = None
         if len(entry_frame) > 1:
@@ -486,11 +505,17 @@ class TrendBacktester:
             entry_vwap_threshold=entry_vwap * (1 + self.strategy_config.entry_vwap_buffer_pct / 100) if not np.isnan(entry_vwap) else float("nan"),
             entry_vwap_prev=previous_entry_vwap,
             entry_vwap_delta_pct=entry_vwap_delta_pct,
+            entry_anchored_vwap=entry_anchored_vwap,
+            entry_anchored_vwap_prev=previous_entry_anchored_vwap,
+            entry_anchored_vwap_delta_pct=entry_anchored_vwap_delta_pct,
+            anchored_vwap_anchor_time=None if anchored_vwap_anchor_time is None else str(anchored_vwap_anchor_time),
             entry_supertrend_direction=int(entry_row["supertrend_direction"]),
             require_entry_above_ema20=bool(self.strategy_config.require_entry_above_ema20),
             require_entry_supertrend=bool(self.strategy_config.require_entry_supertrend),
             require_entry_above_vwap=bool(self.strategy_config.require_entry_above_vwap),
             require_rising_entry_vwap=bool(self.strategy_config.require_rising_entry_vwap),
+            require_entry_above_anchored_vwap=bool(self.strategy_config.require_entry_above_anchored_vwap),
+            require_rising_anchored_vwap=bool(self.strategy_config.require_rising_anchored_vwap),
             entry_vwap_buffer_pct=float(self.strategy_config.entry_vwap_buffer_pct),
             breakout_reference=breakout_reference,
             breakout_threshold=breakout_threshold,

@@ -5,7 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from indicators import enrich_ohlcv
+from indicators import anchored_vwap, enrich_ohlcv
 
 
 @dataclass
@@ -57,11 +57,14 @@ class StrategyConfig:
     breakout_buffer_pct: float = 0.0
     breakout_lookback_bars: int = 4
     entry_vwap_buffer_pct: float = 0.0
+    anchored_vwap_lookback_bars: int = 10
     require_pullback_above_ema50: bool = False
     require_entry_above_ema20: bool = False
     require_entry_supertrend: bool = False
     require_entry_above_vwap: bool = True
     require_rising_entry_vwap: bool = True
+    require_entry_above_anchored_vwap: bool = True
+    require_rising_anchored_vwap: bool = False
     daily_exit_confirm_bars: int = 2
     intraday_exit_confirm_bars: int = 2
     break_even_trigger_r: float = 0.75
@@ -116,11 +119,14 @@ class StrategyConfig:
             breakout_buffer_pct=float(getattr(module, "ALPACA_BREAKOUT_BUFFER_PCT", cls.breakout_buffer_pct)),
             breakout_lookback_bars=int(getattr(module, "ALPACA_BREAKOUT_LOOKBACK_BARS", cls.breakout_lookback_bars)),
             entry_vwap_buffer_pct=float(getattr(module, "ALPACA_ENTRY_VWAP_BUFFER_PCT", cls.entry_vwap_buffer_pct)),
+            anchored_vwap_lookback_bars=int(getattr(module, "ALPACA_ANCHORED_VWAP_LOOKBACK_BARS", cls.anchored_vwap_lookback_bars)),
             require_pullback_above_ema50=bool(getattr(module, "ALPACA_REQUIRE_PULLBACK_ABOVE_EMA50", cls.require_pullback_above_ema50)),
             require_entry_above_ema20=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_ABOVE_EMA20", cls.require_entry_above_ema20)),
             require_entry_supertrend=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_SUPERTREND", cls.require_entry_supertrend)),
             require_entry_above_vwap=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_ABOVE_VWAP", cls.require_entry_above_vwap)),
             require_rising_entry_vwap=bool(getattr(module, "ALPACA_REQUIRE_RISING_ENTRY_VWAP", cls.require_rising_entry_vwap)),
+            require_entry_above_anchored_vwap=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_ABOVE_ANCHORED_VWAP", cls.require_entry_above_anchored_vwap)),
+            require_rising_anchored_vwap=bool(getattr(module, "ALPACA_REQUIRE_RISING_ANCHORED_VWAP", cls.require_rising_anchored_vwap)),
             daily_exit_confirm_bars=int(getattr(module, "ALPACA_DAILY_EXIT_CONFIRM_BARS", cls.daily_exit_confirm_bars)),
             intraday_exit_confirm_bars=int(getattr(module, "ALPACA_INTRADAY_EXIT_CONFIRM_BARS", cls.intraday_exit_confirm_bars)),
             break_even_trigger_r=float(getattr(module, "ALPACA_BREAK_EVEN_TRIGGER_R", cls.break_even_trigger_r)),
@@ -140,6 +146,8 @@ class SignalDecision:
     spread_pct: float | None = None
     signal_score: float = 0.0
     relative_strength: float | None = None
+    anchored_vwap: float | None = None
+    anchored_vwap_anchor_time: str | None = None
     market_regime_reason: str | None = None
 
 
@@ -238,6 +246,23 @@ class StrategyEngine:
         symbol_return = aligned["symbol"].iloc[-1] / aligned["symbol"].iloc[-lookback - 1] - 1
         benchmark_return = aligned["benchmark"].iloc[-1] / aligned["benchmark"].iloc[-lookback - 1] - 1
         return float(symbol_return - benchmark_return)
+
+    def pullback_anchor_timestamp(self, pullback_frame: pd.DataFrame) -> pd.Timestamp | None:
+        if pullback_frame.empty:
+            return None
+
+        lookback = min(len(pullback_frame), max(2, self.config.anchored_vwap_lookback_bars))
+        anchor_window = pullback_frame.iloc[-lookback:]
+        if anchor_window.empty:
+            return None
+
+        return pd.Timestamp(anchor_window["low"].idxmin())
+
+    def compute_entry_anchored_vwap(self, pullback_frame: pd.DataFrame, entry_frame: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Series]:
+        anchor_timestamp = self.pullback_anchor_timestamp(pullback_frame)
+        if anchor_timestamp is None:
+            return None, pd.Series(dtype="float64")
+        return anchor_timestamp, anchored_vwap(entry_frame, anchor_timestamp)
 
     def score_entry_setup(
         self,
@@ -415,6 +440,9 @@ class StrategyEngine:
         entry_vwap = entry_row.get("vwap")
         previous_entry_vwap = previous_entry_row.get("vwap") if previous_entry_row is not None else pd.NA
         vwap_threshold = float(entry_vwap) * (1 + self.config.entry_vwap_buffer_pct / 100) if not pd.isna(entry_vwap) else None
+        anchored_vwap_anchor_time, anchored_vwap_series = self.compute_entry_anchored_vwap(pullback_frame, entry_frame)
+        entry_anchored_vwap = anchored_vwap_series.iloc[-1] if not anchored_vwap_series.empty else pd.NA
+        previous_entry_anchored_vwap = anchored_vwap_series.iloc[-2] if len(anchored_vwap_series) > 1 else pd.NA
 
         if self.config.require_entry_above_ema20 and float(entry_row["close"]) < float(entry_row["ema_20"]):
             return SignalDecision(
@@ -479,6 +507,44 @@ class StrategyEngine:
                     market_regime_reason=regime_reason,
                 )
 
+        if self.config.require_entry_above_anchored_vwap:
+            if pd.isna(entry_anchored_vwap):
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: Anchored VWAP unavailable on {self.config.entry_timeframe}",
+                    relative_strength=relative_strength,
+                    market_regime_reason=regime_reason,
+                )
+            if float(entry_row["close"]) < float(entry_anchored_vwap):
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: entry close below Anchored VWAP: close={self._fmt(entry_row['close'])}, anchored_vwap={self._fmt(entry_anchored_vwap)}",
+                    relative_strength=relative_strength,
+                    anchored_vwap=float(entry_anchored_vwap),
+                    anchored_vwap_anchor_time=None if anchored_vwap_anchor_time is None else str(anchored_vwap_anchor_time),
+                    market_regime_reason=regime_reason,
+                )
+
+        if self.config.require_rising_anchored_vwap:
+            if pd.isna(entry_anchored_vwap) or pd.isna(previous_entry_anchored_vwap):
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: insufficient Anchored VWAP history on {self.config.entry_timeframe}",
+                    relative_strength=relative_strength,
+                    anchored_vwap=float(entry_anchored_vwap) if not pd.isna(entry_anchored_vwap) else None,
+                    anchored_vwap_anchor_time=None if anchored_vwap_anchor_time is None else str(anchored_vwap_anchor_time),
+                    market_regime_reason=regime_reason,
+                )
+            if float(entry_anchored_vwap) <= float(previous_entry_anchored_vwap):
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: Anchored VWAP not rising: current={self._fmt(entry_anchored_vwap)}, previous={self._fmt(previous_entry_anchored_vwap)}",
+                    relative_strength=relative_strength,
+                    anchored_vwap=float(entry_anchored_vwap),
+                    anchored_vwap_anchor_time=None if anchored_vwap_anchor_time is None else str(anchored_vwap_anchor_time),
+                    market_regime_reason=regime_reason,
+                )
+
         signal_score = self.score_entry_setup(daily_row, pullback_row, entry_row, float(extension_atr), volume_ratio, relative_strength)
         if signal_score < self.config.min_entry_score:
             return SignalDecision(
@@ -520,6 +586,8 @@ class StrategyEngine:
             spread_pct=spread_pct,
             signal_score=signal_score,
             relative_strength=relative_strength,
+            anchored_vwap=float(entry_anchored_vwap) if not pd.isna(entry_anchored_vwap) else None,
+            anchored_vwap_anchor_time=None if anchored_vwap_anchor_time is None else str(anchored_vwap_anchor_time),
             market_regime_reason=regime_reason,
         )
 
