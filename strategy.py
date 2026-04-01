@@ -56,9 +56,12 @@ class StrategyConfig:
     min_entry_score: float = 5.5
     breakout_buffer_pct: float = 0.0
     breakout_lookback_bars: int = 4
+    entry_vwap_buffer_pct: float = 0.0
     require_pullback_above_ema50: bool = False
     require_entry_above_ema20: bool = False
     require_entry_supertrend: bool = False
+    require_entry_above_vwap: bool = True
+    require_rising_entry_vwap: bool = True
     daily_exit_confirm_bars: int = 2
     intraday_exit_confirm_bars: int = 2
     break_even_trigger_r: float = 0.75
@@ -112,9 +115,12 @@ class StrategyConfig:
             min_entry_score=float(getattr(module, "ALPACA_MIN_ENTRY_SCORE", cls.min_entry_score)),
             breakout_buffer_pct=float(getattr(module, "ALPACA_BREAKOUT_BUFFER_PCT", cls.breakout_buffer_pct)),
             breakout_lookback_bars=int(getattr(module, "ALPACA_BREAKOUT_LOOKBACK_BARS", cls.breakout_lookback_bars)),
+            entry_vwap_buffer_pct=float(getattr(module, "ALPACA_ENTRY_VWAP_BUFFER_PCT", cls.entry_vwap_buffer_pct)),
             require_pullback_above_ema50=bool(getattr(module, "ALPACA_REQUIRE_PULLBACK_ABOVE_EMA50", cls.require_pullback_above_ema50)),
             require_entry_above_ema20=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_ABOVE_EMA20", cls.require_entry_above_ema20)),
             require_entry_supertrend=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_SUPERTREND", cls.require_entry_supertrend)),
+            require_entry_above_vwap=bool(getattr(module, "ALPACA_REQUIRE_ENTRY_ABOVE_VWAP", cls.require_entry_above_vwap)),
+            require_rising_entry_vwap=bool(getattr(module, "ALPACA_REQUIRE_RISING_ENTRY_VWAP", cls.require_rising_entry_vwap)),
             daily_exit_confirm_bars=int(getattr(module, "ALPACA_DAILY_EXIT_CONFIRM_BARS", cls.daily_exit_confirm_bars)),
             intraday_exit_confirm_bars=int(getattr(module, "ALPACA_INTRADAY_EXIT_CONFIRM_BARS", cls.intraday_exit_confirm_bars)),
             break_even_trigger_r=float(getattr(module, "ALPACA_BREAK_EVEN_TRIGGER_R", cls.break_even_trigger_r)),
@@ -406,6 +412,9 @@ class StrategyEngine:
         breakout = float(entry_row["close"]) >= breakout_threshold
         volume_ratio = float(entry_row["volume"] / entry_row["avg_volume_20"]) if entry_row["avg_volume_20"] and entry_row["avg_volume_20"] > 0 else 0.0
         volume_ok = volume_ratio >= self.config.volume_multiplier
+        entry_vwap = entry_row.get("vwap")
+        previous_entry_vwap = previous_entry_row.get("vwap") if previous_entry_row is not None else pd.NA
+        vwap_threshold = float(entry_vwap) * (1 + self.config.entry_vwap_buffer_pct / 100) if not pd.isna(entry_vwap) else None
 
         if self.config.require_entry_above_ema20 and float(entry_row["close"]) < float(entry_row["ema_20"]):
             return SignalDecision(
@@ -437,6 +446,38 @@ class StrategyEngine:
                 relative_strength=relative_strength,
                 market_regime_reason=regime_reason,
             )
+
+        if self.config.require_entry_above_vwap:
+            if vwap_threshold is None:
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: VWAP unavailable on {self.config.entry_timeframe}",
+                    relative_strength=relative_strength,
+                    market_regime_reason=regime_reason,
+                )
+            if float(entry_row["close"]) < vwap_threshold:
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: entry close below VWAP: close={self._fmt(entry_row['close'])}, vwap={self._fmt(entry_vwap)}, threshold={vwap_threshold:.2f}, buffer_pct={self.config.entry_vwap_buffer_pct:.2f}",
+                    relative_strength=relative_strength,
+                    market_regime_reason=regime_reason,
+                )
+
+        if self.config.require_rising_entry_vwap:
+            if pd.isna(entry_vwap) or pd.isna(previous_entry_vwap):
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: insufficient VWAP history on {self.config.entry_timeframe}",
+                    relative_strength=relative_strength,
+                    market_regime_reason=regime_reason,
+                )
+            if float(entry_vwap) <= float(previous_entry_vwap):
+                return SignalDecision(
+                    "hold",
+                    f"{symbol}: VWAP not rising: current={self._fmt(entry_vwap)}, previous={self._fmt(previous_entry_vwap)}",
+                    relative_strength=relative_strength,
+                    market_regime_reason=regime_reason,
+                )
 
         signal_score = self.score_entry_setup(daily_row, pullback_row, entry_row, float(extension_atr), volume_ratio, relative_strength)
         if signal_score < self.config.min_entry_score:

@@ -4,7 +4,7 @@ This bot now uses a multi-timeframe long-only trend strategy with explicit risk 
 
 ## What Changed
 
-- Proper SuperTrend, ATR, ADX, RSI and EMA calculations based on historical OHLCV data.
+- Proper SuperTrend, ATR, ADX, RSI, session VWAP and EMA calculations based on historical OHLCV data.
 - Market regime filter using SPY and QQQ, with an optional volatility proxy.
 - Relative strength ranking versus QQQ before any order is sent.
 - Entry logic that requires daily trend alignment, hourly pullback and 15-minute breakout confirmation.
@@ -27,7 +27,7 @@ Long entries are allowed only when:
 - Relative strength against the benchmark is above the configured floor.
 - The price is not too extended from EMA 20 and RSI is not overheated.
 - The hourly chart has pulled back into EMA 20 or EMA 50.
-- The 15-minute chart confirms with a breakout above the prior high on stronger volume.
+- The 15-minute chart confirms with a breakout above the prior high on stronger volume while holding above a rising session VWAP.
 - The final setup score is above the minimum ranking threshold.
 
 Open positions are managed with:
@@ -110,7 +110,7 @@ If you still need the raw machine-readable report:
 python backtest.py --json
 ```
 
-The JSON report includes these per-trade values under `entry_filters`, and the terminal summary prints a compact `ENTRY FILTER SNAPSHOTS` table for quick inspection.
+The JSON report includes these per-trade values under `entry_filters`, and the terminal summary prints a compact `ENTRY FILTER SNAPSHOTS` table for quick inspection, including entry price versus VWAP and VWAP slope at the time of entry.
 
 If you want to force a fresh download and overwrite the saved cache:
 

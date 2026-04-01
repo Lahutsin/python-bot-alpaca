@@ -3,9 +3,13 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+
+
+NEW_YORK_TZ = ZoneInfo("America/New_York")
 
 
 def bars_to_dataframe(bars: Iterable) -> pd.DataFrame:
@@ -99,6 +103,26 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     return 100 - (100 / (1 + relative_strength))
 
 
+def session_vwap(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype="float64")
+
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        raise TypeError("session_vwap expects a DatetimeIndex")
+
+    if frame.index.tz is None:
+        localized_index = frame.index.tz_localize("UTC")
+    else:
+        localized_index = frame.index
+
+    session_labels = localized_index.tz_convert(NEW_YORK_TZ).normalize()
+    typical_price = (frame["high"] + frame["low"] + frame["close"]) / 3
+    typical_value = typical_price * frame["volume"]
+    cumulative_value = typical_value.groupby(session_labels).cumsum()
+    cumulative_volume = frame["volume"].groupby(session_labels).cumsum().replace(0, np.nan)
+    return cumulative_value / cumulative_volume
+
+
 def supertrend(frame: pd.DataFrame, length: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
     average_true_range = atr(frame, length)
     hl2 = (frame["high"] + frame["low"]) / 2
@@ -164,6 +188,7 @@ def enrich_ohlcv(
     enriched["atr"] = atr(enriched, atr_length)
     enriched["adx"] = adx(enriched, adx_length)
     enriched["rsi"] = rsi(enriched["close"], 14)
+    enriched["vwap"] = session_vwap(enriched)
     enriched["avg_volume_20"] = enriched["volume"].rolling(20).mean()
     enriched["avg_dollar_volume_20"] = (enriched["close"] * enriched["volume"]).rolling(20).mean()
     supertrend_frame = supertrend(enriched, supertrend_length, supertrend_multiplier)

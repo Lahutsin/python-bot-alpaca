@@ -179,6 +179,8 @@ def trade_filter_rows(report_data: dict[str, Any]) -> list[list[str]]:
                     f"{float(entry_filters.get('rsi', 0.0)):.1f}/{float(entry_filters.get('max_entry_rsi', 0.0)):.1f}",
                     f"{float(entry_filters.get('extension_atr', 0.0)):.2f}/{float(entry_filters.get('max_extension_atr', 0.0)):.2f}",
                     f"{float(entry_filters.get('volume_ratio', 0.0)):.2f}/{float(entry_filters.get('min_volume_ratio', 0.0)):.2f}",
+                    f"{float(entry_filters.get('entry_close', 0.0)):.2f}/{float(entry_filters.get('entry_vwap', 0.0)):.2f}",
+                    f"{float(entry_filters.get('entry_vwap_delta_pct', 0.0) or 0.0):.2f}%",
                     f"{breakout_gap_pct:.2f}%",
                     f"{format_float(float(entry_filters.get('allowed_spread_pct', 0.0)))}%",
                 ]
@@ -285,7 +287,7 @@ def print_terminal_report(report_data: dict[str, Any], initial_equity: float) ->
     trade_rows = trade_filter_rows(report_data)
     if trade_rows:
         print("ENTRY FILTER SNAPSHOTS")
-        trade_headers = ["Symbol", "Entry", "Score", "RS", "ADX", "RSI", "ExtATR", "Vol", "BO%", "Spread"]
+        trade_headers = ["Symbol", "Entry", "Score", "RS", "ADX", "RSI", "ExtATR", "Vol", "Px/VWAP", "VWAPd", "BO%", "Spread"]
         print_table(trade_headers, trade_rows)
         print()
 
@@ -351,9 +353,16 @@ class EntryFilterSnapshot:
     require_pullback_above_ema50: bool
     entry_close: float
     entry_ema_20: float
+    entry_vwap: float
+    entry_vwap_threshold: float
+    entry_vwap_prev: float | None
+    entry_vwap_delta_pct: float | None
     entry_supertrend_direction: int
     require_entry_above_ema20: bool
     require_entry_supertrend: bool
+    require_entry_above_vwap: bool
+    require_rising_entry_vwap: bool
+    entry_vwap_buffer_pct: float
     breakout_reference: float
     breakout_threshold: float
     breakout_close: float
@@ -401,7 +410,7 @@ class TrendBacktester:
             return None
 
         cached_frame.index = pd.to_datetime(cached_frame.index, utc=True)
-        return cached_frame.sort_index()
+        return self.strategy.prepare_frame(cached_frame.sort_index())
 
     def build_entry_filter_snapshot(
         self,
@@ -432,6 +441,15 @@ class TrendBacktester:
         breakout_threshold = breakout_reference * (1 + self.strategy_config.breakout_buffer_pct / 100)
         volume_ratio = float(entry_row["volume"] / entry_row["avg_volume_20"]) if entry_row["avg_volume_20"] and entry_row["avg_volume_20"] > 0 else 0.0
         extension_atr = float((daily_row["close"] - daily_row["ema_20"]) / daily_row["atr"])
+        entry_vwap = float(entry_row["vwap"]) if not pd.isna(entry_row.get("vwap")) else float("nan")
+        previous_entry_vwap = None
+        entry_vwap_delta_pct = None
+        if len(entry_frame) > 1:
+            previous_vwap_value = entry_frame.iloc[-2].get("vwap")
+            if not pd.isna(previous_vwap_value):
+                previous_entry_vwap = float(previous_vwap_value)
+                if previous_entry_vwap != 0:
+                    entry_vwap_delta_pct = ((entry_vwap / previous_entry_vwap) - 1) * 100
         signal_score = float(decision.signal_score)
 
         return EntryFilterSnapshot(
@@ -464,9 +482,16 @@ class TrendBacktester:
             require_pullback_above_ema50=bool(self.strategy_config.require_pullback_above_ema50),
             entry_close=float(entry_row["close"]),
             entry_ema_20=float(entry_row["ema_20"]),
+            entry_vwap=entry_vwap,
+            entry_vwap_threshold=entry_vwap * (1 + self.strategy_config.entry_vwap_buffer_pct / 100) if not np.isnan(entry_vwap) else float("nan"),
+            entry_vwap_prev=previous_entry_vwap,
+            entry_vwap_delta_pct=entry_vwap_delta_pct,
             entry_supertrend_direction=int(entry_row["supertrend_direction"]),
             require_entry_above_ema20=bool(self.strategy_config.require_entry_above_ema20),
             require_entry_supertrend=bool(self.strategy_config.require_entry_supertrend),
+            require_entry_above_vwap=bool(self.strategy_config.require_entry_above_vwap),
+            require_rising_entry_vwap=bool(self.strategy_config.require_rising_entry_vwap),
+            entry_vwap_buffer_pct=float(self.strategy_config.entry_vwap_buffer_pct),
             breakout_reference=breakout_reference,
             breakout_threshold=breakout_threshold,
             breakout_close=float(entry_row["close"]),
