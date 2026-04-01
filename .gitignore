@@ -129,6 +129,9 @@ venv.bak/
 data/
 config.py
 trade_journal.csv
+debug.log
+bot_state.json
+bot_heartbeat.json
 
 # Spyder project settings
 .spyderproject
